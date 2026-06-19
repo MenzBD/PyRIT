@@ -4,14 +4,15 @@
 import base64
 import logging
 from io import BytesIO
-from typing import Literal, Optional
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import aiohttp
 from PIL import Image
 
-from pyrit.models import PromptDataType, data_serializer_factory
-from pyrit.prompt_converter import ConverterResult, PromptConverter
+from pyrit.memory import data_serializer_factory
+from pyrit.models import ComponentIdentifier, PromptDataType
+from pyrit.prompt_converter.prompt_converter import ConverterResult, PromptConverter
 
 logger = logging.getLogger(__name__)
 
@@ -43,31 +44,35 @@ class ImageCompressionConverter(PromptConverter):
         https://pillow.readthedocs.io/en/stable/handbook/image-file-formats.html#webp-saving
     """
 
+    SUPPORTED_INPUT_TYPES = ("image_path", "url")
+    SUPPORTED_OUTPUT_TYPES = ("image_path",)
+
     def __init__(
         self,
         *,
-        output_format: Optional[Literal["JPEG", "PNG", "WEBP"]] = None,
-        quality: Optional[int] = None,
-        optimize: Optional[bool] = None,
-        progressive: Optional[bool] = None,
-        compress_level: Optional[int] = None,
-        lossless: Optional[bool] = None,
-        method: Optional[int] = None,
+        output_format: Literal["JPEG", "PNG", "WEBP"] | None = None,
+        quality: int | None = None,
+        optimize: bool | None = None,
+        progressive: bool | None = None,
+        compress_level: int | None = None,
+        lossless: bool | None = None,
+        method: int | None = None,
         background_color: tuple[int, int, int] = (0, 0, 0),
         min_compression_threshold: int = 1024,
         fallback_to_original: bool = True,
-    ):
+    ) -> None:
         """
-        Initializes the converter with specified compression settings.
+        Initialize the converter with specified compression settings.
 
         Args:
-            output_format (str, optional): Output image format. If None, keeps original format (if supported).
-            quality (int, optional): General quality setting for JPEG and WEBP formats (0-100).\n
-                For JPEG format, it represents the image quality, on a scale from 0 (worst) to 95 (best).\n
+            output_format (str, optional): Output image format. Must be one of 'JPEG', 'PNG', or 'WEBP'.
+            If None, keeps original format (if supported).
+            quality (int, optional): General quality setting for JPEG and WEBP formats (0-100).
+                For JPEG format, it represents the image quality, on a scale from 0 (worst) to 95 (best).
                 For WEBP format, the value ranges from 0 to 100; for lossy compression: 0-smallest file size and
                 100-largest; for ``lossless``: 0-fastest/less efficient, and 100 gives the best compression.
-            optimize (bool, optional): Whether to optimize the image during compression. \n
-                For JPEG: makes the encoder perform an extra pass over the image to select optimal settings.\n
+            optimize (bool, optional): Whether to optimize the image during compression.
+                For JPEG: makes the encoder perform an extra pass over the image to select optimal settings.
                 For PNG: instructs the PNG writer to make the output file as small as possible.
             progressive (bool, optional): Whether to save JPEG images as progressive.
             compress_level (int, optional): ZLIB compression level (0-9): 1=fastest, 9=best, 0=none.
@@ -120,14 +125,49 @@ class ImageCompressionConverter(PromptConverter):
                 "Using quality > 95 for JPEG may result in larger files. Consider using a lower quality setting."
             )
 
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build identifier with image compression parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this converter.
+        """
+        return self._create_identifier(
+            params={
+                "output_format": self._output_format,
+                "quality": self._quality,
+                "optimize": self._optimize,
+                "progressive": self._progressive,
+                "compress_level": self._compress_level,
+                "lossless": self._lossless,
+                "method": self._method,
+            }
+        )
+
     def _should_compress(self, original_size: int) -> bool:
-        """Determines if image should be compressed."""
-        if original_size < self._min_compression_threshold:
-            return False  # skip compression for small images
-        return True
+        """
+        Determine if image should be compressed.
+
+        Args:
+            original_size (int): The size of the original image in bytes.
+
+        Returns:
+            bool: True if the image should be compressed, False otherwise.
+        """
+        return original_size >= self._min_compression_threshold
 
     def _compress_image(self, image: Image.Image, original_format: str, original_size: int) -> tuple[BytesIO, str]:
-        """Compresses the image with the specified settings. Returns the compressed image bytes and output format."""
+        """
+        Compress the image with the specified settings. Returns the compressed image bytes and output format.
+
+        Args:
+            image (PIL.Image.Image): The image to be compressed.
+            original_format (str): The original format of the image.
+            original_size (int): The size of the original image in bytes.
+
+        Returns:
+            tuple[BytesIO, str]: A tuple containing the compressed image bytes and the output format.
+        """
         original_format = original_format.upper()
         output_format = self._output_format or (
             original_format if original_format in ("JPEG", "PNG", "WEBP") else "JPEG"
@@ -148,7 +188,7 @@ class ImageCompressionConverter(PromptConverter):
             else:
                 image = image.convert("RGB")
 
-        save_kwargs: dict = {}
+        save_kwargs: dict[str, Any] = {}
 
         # Format-specific options for currently supported output types
         if output_format == "JPEG":
@@ -178,30 +218,57 @@ class ImageCompressionConverter(PromptConverter):
         image.save(compressed_bytes, output_format, **save_kwargs)
         return compressed_bytes, output_format
 
-    async def _handle_original_image_fallback(
-        self, prompt: str, input_type: PromptDataType, img_serializer, original_img_bytes: bytes, original_format: str
+    async def _handle_original_image_fallback_async(
+        self,
+        prompt: str,
+        input_type: PromptDataType,
+        img_serializer: Any,
+        original_img_bytes: bytes,
+        original_format: str,
     ) -> ConverterResult:
-        """Handles fallback to original image for both URL and file path inputs."""
+        """
+        Handle fallback to original image for both URL and file path inputs.
+
+        Args:
+            prompt (str): The original prompt (image path or URL).
+            input_type (PromptDataType): The type of input data.
+            img_serializer: The data serializer for the image.
+            original_img_bytes (bytes): The original image bytes.
+            original_format (str): The original image format.
+
+        Returns:
+            ConverterResult: The result containing path to the original image.
+        """
         if input_type == "url":
             # We need to save the downloaded content locally and return the local path
             img_serializer.file_extension = original_format.lower()
-            await img_serializer.save_data(original_img_bytes)
+            await img_serializer.save_data_async(original_img_bytes)
             return ConverterResult(output_text=str(img_serializer.value), output_type="image_path")
         return ConverterResult(output_text=prompt, output_type="image_path")
 
-    async def _read_image_from_url(self, url: str) -> bytes:
-        """Downloads data from URL and returns the content as bytes."""
+    async def _read_image_from_url_async(self, url: str) -> bytes:
+        """
+        Download data from URL and returns the content as bytes.
+
+        Args:
+            url (str): The URL to download the image from.
+
+        Returns:
+            bytes: The content of the image as bytes.
+
+        Raises:
+            RuntimeError: If there is an error during the download process.
+        """
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    response.raise_for_status()
-                    return await response.read()
+            async with aiohttp.ClientSession() as session, session.get(url) as response:
+                response.raise_for_status()
+                return await response.read()
         except aiohttp.ClientError as e:
-            raise RuntimeError(f"Failed to download content from URL {url}: {str(e)}")
+            raise RuntimeError(f"Failed to download content from URL {url}: {str(e)}") from e
 
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "image_path") -> ConverterResult:
         """
-        Converts the given prompt (image) by compressing it.
+        Convert the given prompt (image) by compressing it.
 
         Args:
             prompt (str): The image file path or URL pointing to the image to be compressed.
@@ -222,7 +289,9 @@ class ImageCompressionConverter(PromptConverter):
 
         # Read the image data into memory as bytes for processing
         original_img_bytes = (
-            await self._read_image_from_url(prompt) if input_type == "url" else await img_serializer.read_data()
+            await self._read_image_from_url_async(prompt)
+            if input_type == "url"
+            else await img_serializer.read_data_async()
         )
         original_img = Image.open(BytesIO(original_img_bytes))
 
@@ -232,7 +301,7 @@ class ImageCompressionConverter(PromptConverter):
         # This is to avoid unnecessary processing and potential quality loss for images that are already small
         if not self._should_compress(original_size):
             logger.warning(f"Image too small ({original_size} bytes), skipping compression")
-            return await self._handle_original_image_fallback(
+            return await self._handle_original_image_fallback_async(
                 prompt, input_type, img_serializer, original_img_bytes, original_format
             )
 
@@ -245,7 +314,7 @@ class ImageCompressionConverter(PromptConverter):
         # Sometimes compression can actually increase file size so we check if we should fallback to the original
         if self._fallback_to_original and compressed_size >= original_size:
             logger.warning(f"Compression increased file size ({original_size} → {compressed_size}), using original")
-            return await self._handle_original_image_fallback(
+            return await self._handle_original_image_fallback_async(
                 prompt, input_type, img_serializer, original_img_bytes, original_format
             )
 
@@ -256,15 +325,9 @@ class ImageCompressionConverter(PromptConverter):
 
         # Convert compressed bytes to base64 for storage via the serializer
         image_str = base64.b64encode(compressed_bytes_value)
-        await img_serializer.save_b64_image(data=image_str.decode())
+        await img_serializer.save_b64_image_async(data=image_str.decode())
 
         compression_ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
         logger.info(f"Image compressed: {original_size} → {compressed_size} ({compression_ratio:.1f}% reduction)")
 
         return ConverterResult(output_text=str(img_serializer.value), output_type="image_path")
-
-    def input_supported(self, input_type: PromptDataType) -> bool:
-        return input_type in ("image_path", "url")
-
-    def output_supported(self, output_type: PromptDataType) -> bool:
-        return output_type == "image_path"

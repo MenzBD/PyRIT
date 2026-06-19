@@ -1,23 +1,28 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+import io
+import logging
 import os
+import tempfile
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import ARRAY, DateTime, Integer, String, inspect
+from sqlalchemy import ARRAY, DateTime, Integer, String, create_engine, inspect, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.sqlite import CHAR, JSON
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.sqltypes import NullType
-from unit.mocks import get_sample_conversation_entries
 
+from pyrit.memory.alembic.versions.ab8f2c1a9d07_pre_alembic_release_schema import INITIAL_METADATA
 from pyrit.memory.memory_models import EmbeddingDataEntry, PromptMemoryEntry
-from pyrit.models import MessagePiece
+from pyrit.memory.migration import run_schema_migrations
+from pyrit.models import Conversation, MessagePiece
 from pyrit.prompt_converter.base64_converter import Base64Converter
 from pyrit.prompt_target.text_target import TextTarget
+from unit.mocks import get_sample_conversation_entries
 
 
 @pytest.fixture
@@ -52,7 +57,6 @@ def test_conversation_data_schema(sqlite_instance):
         "labels",
         "prompt_metadata",
         "converter_identifiers",
-        "prompt_target_identifier",
         "original_value_data_type",
         "original_value",
         "original_value_sha256",
@@ -91,8 +95,6 @@ def test_conversation_data_column_types(sqlite_instance):
         "labels": (String, JSON),
         "prompt_metadata": (String, JSON),
         "converter_identifiers": (String, JSON),
-        "prompt_target_identifier": (String, JSON),
-        "attack_identifier": (String, JSON),
         "response_error": String,
         "original_value_data_type": String,
         "original_value": String,
@@ -109,13 +111,13 @@ def test_conversation_data_column_types(sqlite_instance):
 
             # Handle columns that can have multiple types depending on database
             if isinstance(expected_type, tuple):
-                assert any(
-                    issubclass(column_types[column], t) for t in expected_type
-                ), f"Expected {column} to be a subclass of any of {expected_type}, got {column_types[column]} instead."
+                assert any(issubclass(column_types[column], t) for t in expected_type), (
+                    f"Expected {column} to be a subclass of any of {expected_type}, got {column_types[column]} instead."
+                )
             else:
-                assert issubclass(
-                    column_types[column], expected_type
-                ), f"Expected {column} to be a subclass of {expected_type}, got {column_types[column]} instead."
+                assert issubclass(column_types[column], expected_type), (
+                    f"Expected {column} to be a subclass of {expected_type}, got {column_types[column]} instead."
+                )
 
 
 def test_embedding_data_column_types(sqlite_instance):
@@ -135,14 +137,14 @@ def test_embedding_data_column_types(sqlite_instance):
             assert column in column_types, f"{column} not found in EmbeddingStore schema."
             # Handle columns that can have multiple types depending on database
             if isinstance(expected_type, tuple):
-                assert any(
-                    issubclass(column_types[column], t) for t in expected_type
-                ), f"Expected {column} to be a subclass of any of {expected_type}, got {column_types[column]} instead."
+                assert any(issubclass(column_types[column], t) for t in expected_type), (
+                    f"Expected {column} to be a subclass of any of {expected_type}, got {column_types[column]} instead."
+                )
             else:
                 # Allow for flexibility in type representation (String vs. VARCHAR)
-                assert issubclass(
-                    column_types[column], expected_type
-                ), f"Expected {column} to be a subclass of {expected_type}, got {column_types[column]} instead."
+                assert issubclass(column_types[column], expected_type), (
+                    f"Expected {column} to be a subclass of {expected_type}, got {column_types[column]} instead."
+                )
     # Handle 'embedding' column separately
     assert "embedding" in column_types, "'embedding' column not found in EmbeddingData schema."
     # Check if 'embedding' column type is either NullType (due to reflection issue), ARRAY, or JSON (SQLite)
@@ -153,7 +155,184 @@ def test_embedding_data_column_types(sqlite_instance):
     ], f"Unexpected type for 'embedding' column: {column_types['embedding']}"
 
 
-@pytest.mark.asyncio()
+def test_run_schema_migrations_stamps_matching_unversioned_legacy_database():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "legacy-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            initial_metadata = INITIAL_METADATA
+            initial_metadata.create_all(engine)
+
+            run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "pyrit_memory_alembic_version" in table_names
+
+            with engine.connect() as connection:
+                version = connection.execute(text("SELECT version_num FROM pyrit_memory_alembic_version")).scalar_one()
+
+            assert version
+        finally:
+            engine.dispose()
+
+
+def test_run_schema_migrations_stamps_unversioned_legacy_database_with_extra_tables():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "legacy-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            initial_metadata = INITIAL_METADATA
+            initial_metadata.create_all(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        CREATE TABLE "SharedAuditLog" (
+                            id INTEGER PRIMARY KEY,
+                            event_name VARCHAR NOT NULL
+                        )
+                        """
+                    )
+                )
+
+            run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "SharedAuditLog" in table_names
+            assert "pyrit_memory_alembic_version" in table_names
+
+            with engine.connect() as connection:
+                version = connection.execute(text("SELECT version_num FROM pyrit_memory_alembic_version")).scalar_one()
+
+            assert version
+        finally:
+            engine.dispose()
+
+
+def test_run_schema_migrations_fails_synthetic_unversioned_schema_with_drift():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "legacy-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            initial_metadata = INITIAL_METADATA
+            initial_metadata.create_all(engine)
+            with engine.begin() as connection:
+                connection.execute(text('DROP TABLE "ScoreEntries"'))
+
+            with pytest.raises(RuntimeError, match="unversioned legacy memory schema"):
+                run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "pyrit_memory_alembic_version" not in table_names
+        finally:
+            engine.dispose()
+
+
+def test_run_schema_migrations_fails_pre_alembic_like_schema() -> None:
+    """
+    Validate strict behavior for unsupported legacy schemas.
+
+    This schema shape intentionally resembles an older pre-Alembic layout where
+    newer columns (e.g. pyrit_version, converter_identifiers) are absent.
+    Such databases are intentionally unsupported and must fail migration checks.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "legacy-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        CREATE TABLE "PromptMemoryEntries" (
+                            id CHAR(36) NOT NULL,
+                            role VARCHAR NOT NULL,
+                            conversation_id VARCHAR NOT NULL,
+                            sequence INTEGER NOT NULL,
+                            timestamp DATETIME NOT NULL,
+                            labels JSON NOT NULL,
+                            prompt_metadata JSON NOT NULL,
+                            prompt_target_identifier JSON NOT NULL,
+                            attack_identifier JSON NOT NULL,
+                            original_value_data_type VARCHAR NOT NULL,
+                            original_value VARCHAR NOT NULL,
+                            original_value_sha256 VARCHAR,
+                            converted_value_data_type VARCHAR NOT NULL,
+                            converted_value VARCHAR,
+                            converted_value_sha256 VARCHAR,
+                            original_prompt_id CHAR(36) NOT NULL,
+                            PRIMARY KEY (id)
+                        )
+                        """
+                    )
+                )
+
+            with pytest.raises(RuntimeError, match="unversioned legacy memory schema"):
+                run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "pyrit_memory_alembic_version" not in table_names
+        finally:
+            engine.dispose()
+
+
+def test_run_schema_migrations_isolates_foreign_alembic_version_table():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "legacy-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            initial_metadata = INITIAL_METADATA
+            initial_metadata.create_all(engine)
+            with engine.begin() as connection:
+                connection.execute(text('CREATE TABLE "alembic_version" (version_num VARCHAR(32) NOT NULL)'))
+
+            run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "alembic_version" in table_names
+            assert "pyrit_memory_alembic_version" in table_names
+
+            with engine.connect() as connection:
+                version = connection.execute(text("SELECT version_num FROM pyrit_memory_alembic_version")).scalar_one()
+
+            assert version
+        finally:
+            engine.dispose()
+
+
+def test_reset_database_recreates_schema(sqlite_instance):
+    sqlite_instance.reset_database()
+
+    inspector = inspect(sqlite_instance.engine)
+    table_names = set(inspector.get_table_names())
+
+    assert {
+        "AttackResultEntries",
+        "EmbeddingData",
+        "PromptMemoryEntries",
+        "ScenarioResultEntries",
+        "ScoreEntries",
+        "SeedPromptEntries",
+        "pyrit_memory_alembic_version",
+    }.issubset(table_names)
+
+    with sqlite_instance.engine.connect() as connection:
+        version = connection.execute(text("SELECT version_num FROM pyrit_memory_alembic_version")).scalar_one()
+
+    assert version
+
+
+def test_reset_database_keeps_foreign_alembic_version_table(sqlite_instance):
+    with sqlite_instance.engine.begin() as connection:
+        connection.execute(text('CREATE TABLE "alembic_version" (version_num VARCHAR(32) NOT NULL)'))
+
+    sqlite_instance.reset_database()
+
+    table_names = set(inspect(sqlite_instance.engine).get_table_names())
+    assert "alembic_version" in table_names
+    assert "pyrit_memory_alembic_version" in table_names
+
+
 async def test_insert_entry(sqlite_instance):
     session = sqlite_instance.get_session()
     message_piece_entry = MessagePiece(
@@ -278,34 +457,33 @@ def test_insert_embedding_entry(sqlite_instance):
 def test_disable_embedding(sqlite_instance):
     sqlite_instance.disable_embedding()
 
-    assert (
-        sqlite_instance.memory_embedding is None
-    ), "disable_memory flag was passed, so memory embedding should be disabled."
+    assert sqlite_instance.memory_embedding is None, (
+        "disable_memory flag was passed, so memory embedding should be disabled."
+    )
 
 
 def test_default_enable_embedding(sqlite_instance):
-    os.environ["AZURE_OPENAI_EMBEDDING_KEY"] = "mock_key"
-    os.environ["AZURE_OPENAI_EMBEDDING_ENDPOINT"] = "embedding"
-    os.environ["AZURE_OPENAI_EMBEDDING_DEPLOYMENT"] = "deployment"
+    os.environ["OPENAI_EMBEDDING_KEY"] = "mock_key"
+    os.environ["OPENAI_EMBEDDING_ENDPOINT"] = "embedding"
+    os.environ["OPENAI_EMBEDDING_MODEL"] = "deployment"
 
     sqlite_instance.enable_embedding()
 
-    assert (
-        sqlite_instance.memory_embedding is not None
-    ), "Memory embedding should be enabled when set with environment variables."
+    assert sqlite_instance.memory_embedding is not None, (
+        "Memory embedding should be enabled when set with environment variables."
+    )
 
 
 def test_default_embedding_raises(sqlite_instance):
-    os.environ["AZURE_OPENAI_EMBEDDING_KEY"] = ""
-    os.environ["AZURE_OPENAI_EMBEDDING_ENDPOINT"] = ""
-    os.environ["AZURE_OPENAI_EMBEDDING_DEPLOYMENT"] = ""
+    os.environ["OPENAI_EMBEDDING_KEY"] = ""
+    os.environ["OPENAI_EMBEDDING_ENDPOINT"] = ""
+    os.environ["OPENAI_EMBEDDING_MODEL"] = ""
 
     with pytest.raises(ValueError):
         sqlite_instance.enable_embedding()
 
 
 def test_query_entries(sqlite_instance, sample_conversation_entries):
-
     for i in range(3):
         sample_conversation_entries[i].conversation_id = str(i)
         sample_conversation_entries[i].original_value = f"Message {i}"
@@ -326,7 +504,6 @@ def test_query_entries(sqlite_instance, sample_conversation_entries):
 
 
 def test_get_all_memory(sqlite_instance, sample_conversation_entries):
-
     sqlite_instance._insert_entries(entries=sample_conversation_entries)
 
     # Fetch all entries
@@ -341,47 +518,79 @@ def test_get_memories_with_json_properties(sqlite_instance):
     converter_identifiers = [Base64Converter().get_identifier()]
     target = TextTarget()
 
-    # Start a session
-    with sqlite_instance.get_session() as session:
-        # Create a ConversationData entry with all attributes filled
-        piece = MessagePiece(
-            conversation_id=specific_conversation_id,
-            role="user",
-            sequence=1,
-            original_value="Test content",
-            converted_value="Test content",
-            labels={"normalizer_id": "id1"},
-            converter_identifiers=converter_identifiers,
-            prompt_target_identifier=target.get_identifier(),
-        )
-        entry = PromptMemoryEntry(entry=piece)
+    piece = MessagePiece(
+        conversation_id=specific_conversation_id,
+        role="user",
+        sequence=1,
+        original_value="Test content",
+        converted_value="Test content",
+        labels={"normalizer_id": "id1"},
+        converter_identifiers=converter_identifiers,
+    )
 
-        # Insert the ConversationData entry
-        session.add(entry)
-        session.commit()
+    sqlite_instance.add_conversation_to_memory(
+        conversation=Conversation(conversation_id=specific_conversation_id, target_identifier=target.get_identifier())
+    )
+    sqlite_instance.add_message_pieces_to_memory(message_pieces=[piece])
 
-        # Use the get_memories_with_conversation_id method to retrieve entries with the specific conversation_id
-        retrieved_entries = sqlite_instance.get_conversation(conversation_id=specific_conversation_id)
+    # Use the get_memories_with_conversation_id method to retrieve entries with the specific conversation_id
+    retrieved_entries = sqlite_instance.get_conversation_messages(conversation_id=specific_conversation_id)
 
-        # Verify that the retrieved entry matches the inserted entry
-        assert len(retrieved_entries) == 1
-        retrieved_entry = retrieved_entries[0].message_pieces[0]
-        assert retrieved_entry.conversation_id == specific_conversation_id
-        assert retrieved_entry.role == "user"
-        assert retrieved_entry.original_value == "Test content"
-        # For timestamp, you might want to check if it's close to the current time instead of an exact match
-        assert abs((retrieved_entry.timestamp - piece.timestamp).total_seconds()) < 0.1
-        assert abs((retrieved_entry.timestamp - entry.timestamp).total_seconds()) < 0.1
+    # Verify that the retrieved entry matches the inserted entry
+    assert len(retrieved_entries) == 1
+    retrieved_entry = retrieved_entries[0].message_pieces[0]
+    assert retrieved_entry.conversation_id == specific_conversation_id
+    assert retrieved_entry.api_role == "user"
+    assert retrieved_entry.original_value == "Test content"
+    # For timestamp, you might want to check if it's close to the current time instead of an exact match
+    assert abs((retrieved_entry.timestamp - piece.timestamp).total_seconds()) < 0.1
 
-        converter_identifiers = retrieved_entry.converter_identifiers
-        assert len(converter_identifiers) == 1
-        assert converter_identifiers[0]["__type__"] == "Base64Converter"
+    converter_identifiers = retrieved_entry.converter_identifiers
+    assert len(converter_identifiers) == 1
+    assert converter_identifiers[0].class_name == "Base64Converter"
 
-        prompt_target = retrieved_entry.prompt_target_identifier
-        assert prompt_target["__type__"] == "TextTarget"
+    # The target identifier is conversation-scoped and stored in the Conversations table.
+    metadata = sqlite_instance._get_conversation(conversation_id=specific_conversation_id)
+    assert metadata is not None
+    assert metadata.target_identifier.class_name == "TextTarget"
 
-        labels = retrieved_entry.labels
-        assert labels["normalizer_id"] == "id1"
+    labels = retrieved_entry.labels
+    assert labels["normalizer_id"] == "id1"
+
+
+def test_register_conversation_none_target_does_not_clobber(sqlite_instance):
+    # A conversation is held with a single target. Registering it records the
+    # target; a later registration for the same conversation with no target (e.g.
+    # a branched copy whose source had no metadata) must NOT overwrite it with None.
+    conversation_id = "conv-none-clobber"
+    target = TextTarget()
+
+    request_piece = MessagePiece(
+        conversation_id=conversation_id,
+        role="user",
+        sequence=1,
+        original_value="hello",
+    )
+    sqlite_instance.add_conversation_to_memory(
+        conversation=Conversation(conversation_id=conversation_id, target_identifier=target.get_identifier())
+    )
+    sqlite_instance.add_message_pieces_to_memory(message_pieces=[request_piece])
+
+    response_piece = MessagePiece(
+        conversation_id=conversation_id,
+        role="assistant",
+        sequence=2,
+        original_value="world",
+    )
+    sqlite_instance.add_conversation_to_memory(
+        conversation=Conversation(conversation_id=conversation_id, target_identifier=None)
+    )
+    sqlite_instance.add_message_pieces_to_memory(message_pieces=[response_piece])
+
+    metadata = sqlite_instance._get_conversation(conversation_id=conversation_id)
+    assert metadata is not None
+    assert metadata.target_identifier is not None
+    assert metadata.target_identifier.class_name == "TextTarget"
 
 
 def test_update_entries(sqlite_instance):
@@ -549,3 +758,286 @@ def test_update_prompt_metadata_by_conversation_id(sqlite_instance, sample_conve
         # Verify that the entry with a different conversation_id was not updated
         other_entry = session.query(PromptMemoryEntry).filter_by(conversation_id="other_id").first()
         assert other_entry.prompt_metadata == original_metadata  # Metadata should remain unchanged
+
+
+def test_get_conversation_stats_returns_empty_for_no_ids(sqlite_instance):
+    """Test that get_conversation_stats returns empty dict for empty input."""
+    result = sqlite_instance.get_conversation_stats(conversation_ids=[])
+    assert result == {}
+
+
+def test_get_conversation_stats_returns_empty_for_unknown_ids(sqlite_instance):
+    """Test that get_conversation_stats omits unknown conversation IDs."""
+    result = sqlite_instance.get_conversation_stats(conversation_ids=["nonexistent"])
+    assert result == {}
+
+
+def test_get_conversation_stats_counts_distinct_sequences(sqlite_instance, sample_conversation_entries):
+    """Test that message_count reflects distinct sequence numbers, not raw rows."""
+    # Extract conversation IDs and sequences before inserting (entries get detached after commit)
+    from pyrit.models import Message
+    from unit.mocks import get_sample_conversations
+
+    conversations = get_sample_conversations()
+    pieces = Message.flatten_to_message_pieces(conversations)
+    expected: dict[str, set[int]] = {}
+    for p in pieces:
+        expected.setdefault(p.conversation_id, set()).add(p.sequence)
+
+    sqlite_instance._insert_entries(entries=sample_conversation_entries)
+
+    conv_ids = list(expected.keys())
+    result = sqlite_instance.get_conversation_stats(conversation_ids=conv_ids)
+
+    for conv_id in conv_ids:
+        if conv_id in result:
+            assert result[conv_id].message_count == len(expected[conv_id]), (
+                f"Conv {conv_id}: expected {len(expected[conv_id])}, got {result[conv_id].message_count}"
+            )
+
+
+def test_get_conversation_stats_returns_labels(sqlite_instance):
+    """Test that labels from the first piece with non-empty labels are returned."""
+    import uuid
+
+    from pyrit.models import MessagePiece
+
+    conv_id = str(uuid.uuid4())
+    piece = MessagePiece(
+        role="user",
+        original_value="hello",
+        original_value_data_type="text",
+        converted_value="hello",
+        converted_value_data_type="text",
+        conversation_id=conv_id,
+        sequence=0,
+        labels={"env": "prod", "source": "gui"},
+    )
+    entry = PromptMemoryEntry(entry=piece)
+    sqlite_instance._insert_entry(entry)
+
+    result = sqlite_instance.get_conversation_stats(conversation_ids=[conv_id])
+    assert conv_id in result
+    assert result[conv_id].labels == {"env": "prod", "source": "gui"}
+
+
+def test_get_conversation_stats_preview_caps_raw_value_at_fetch_limit(sqlite_instance):
+    """Memory caps the raw last_message_preview at PREVIEW_FETCH_MAX_LEN.
+
+    Display-level truncation to PREVIEW_MAX_LEN happens later in the backend
+    mapper. This test verifies the storage-fetch contract: very long values
+    are bounded so a multi-MB text response doesn't bloat ``ConversationStats``.
+    """
+    import uuid
+
+    from pyrit.models import ConversationStats, MessagePiece
+
+    conv_id = str(uuid.uuid4())
+    huge_text = "x" * (ConversationStats.PREVIEW_FETCH_MAX_LEN * 3)
+    piece = MessagePiece(
+        role="assistant",
+        original_value=huge_text,
+        original_value_data_type="text",
+        converted_value=huge_text,
+        converted_value_data_type="text",
+        conversation_id=conv_id,
+        sequence=0,
+    )
+    entry = PromptMemoryEntry(entry=piece)
+    sqlite_instance._insert_entry(entry)
+
+    result = sqlite_instance.get_conversation_stats(conversation_ids=[conv_id])
+    assert conv_id in result
+    preview = result[conv_id].last_message_preview
+    assert preview is not None
+    assert len(preview) == ConversationStats.PREVIEW_FETCH_MAX_LEN
+    assert preview == "x" * ConversationStats.PREVIEW_FETCH_MAX_LEN
+    assert result[conv_id].last_message_data_type == "text"
+
+
+def test_get_conversation_stats_batches_multiple_conversations(sqlite_instance):
+    """Test that a single call returns stats for multiple conversations."""
+    import uuid
+
+    from pyrit.models import MessagePiece
+
+    conv_ids = [str(uuid.uuid4()) for _ in range(3)]
+    entries = []
+    for i, cid in enumerate(conv_ids):
+        for seq in range(i + 1):  # conv 0: 1 msg, conv 1: 2 msgs, conv 2: 3 msgs
+            piece = MessagePiece(
+                role="user",
+                original_value=f"msg-{seq}",
+                original_value_data_type="text",
+                converted_value=f"msg-{seq}",
+                converted_value_data_type="text",
+                conversation_id=cid,
+                sequence=seq,
+            )
+            entries.append(PromptMemoryEntry(entry=piece))
+
+    sqlite_instance._insert_entries(entries=entries)
+
+    result = sqlite_instance.get_conversation_stats(conversation_ids=conv_ids)
+
+    assert len(result) == 3
+    assert result[conv_ids[0]].message_count == 1
+    assert result[conv_ids[1]].message_count == 2
+    assert result[conv_ids[2]].message_count == 3
+
+
+@pytest.mark.parametrize(
+    "data_type",
+    ["image_path", "audio_path", "video_path", "binary_path"],
+)
+def test_get_conversation_stats_returns_media_data_type(sqlite_instance, data_type):
+    """Memory exposes the raw value + data type for the last piece — the
+    backend mapper handles display formatting. Verifies the data type is
+    propagated so downstream consumers can render media previews safely."""
+    import uuid
+
+    from pyrit.models import MessagePiece
+
+    conv_id = str(uuid.uuid4())
+    path = r"C:\Users\someone\git\PyRIT\dbdata\prompt-memory-entries\media\1780010098266691.bin"
+    piece = MessagePiece(
+        role="assistant",
+        original_value=path,
+        original_value_data_type=data_type,
+        converted_value=path,
+        converted_value_data_type=data_type,
+        conversation_id=conv_id,
+        sequence=0,
+    )
+    sqlite_instance._insert_entry(PromptMemoryEntry(entry=piece))
+
+    result = sqlite_instance.get_conversation_stats(conversation_ids=[conv_id])
+    stats = result[conv_id]
+
+    assert stats.last_message_data_type == data_type
+    # Memory returns the raw value (truncated up to PREVIEW_FETCH_MAX_LEN);
+    # formatting/labeling is the backend mapper's responsibility.
+    assert stats.last_message_preview == path
+
+
+def test_get_conversation_stats_uses_last_piece_data_type(sqlite_instance):
+    """Stats reflect the data type of the most recent message, not the
+    first one, so the backend mapper picks the right rendering."""
+    import uuid
+
+    from pyrit.models import MessagePiece
+
+    conv_id = str(uuid.uuid4())
+    text_piece = MessagePiece(
+        role="user",
+        original_value="hi there",
+        original_value_data_type="text",
+        converted_value="hi there",
+        converted_value_data_type="text",
+        conversation_id=conv_id,
+        sequence=0,
+    )
+    audio_path = r"C:\dbdata\prompt-memory-entries\audio\response.mp3"
+    media_piece = MessagePiece(
+        role="assistant",
+        original_value=audio_path,
+        original_value_data_type="audio_path",
+        converted_value=audio_path,
+        converted_value_data_type="audio_path",
+        conversation_id=conv_id,
+        sequence=1,
+    )
+    sqlite_instance._insert_entries(entries=[PromptMemoryEntry(entry=text_piece), PromptMemoryEntry(entry=media_piece)])
+
+    result = sqlite_instance.get_conversation_stats(conversation_ids=[conv_id])
+    stats = result[conv_id]
+
+    assert stats.last_message_data_type == "audio_path"
+    assert stats.last_message_preview == audio_path
+
+
+def test_dispose_engine_tolerates_closed_log_stream(sqlite_instance, capsys):
+    """Verify dispose_engine does not raise or emit 'Logging error' when streams are closed (GH-1520)."""
+    pyrit_logger = logging.getLogger("pyrit")
+    prev_level = pyrit_logger.level
+    pyrit_logger.setLevel(logging.INFO)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    root = logging.getLogger()
+    root.addHandler(handler)
+
+    try:
+        stream.close()
+        sqlite_instance.dispose_engine()
+    finally:
+        root.removeHandler(handler)
+        pyrit_logger.setLevel(prev_level)
+
+    captured = capsys.readouterr()
+    assert "Logging error" not in captured.err
+
+
+def test_create_engine_uses_static_pool_for_in_memory(sqlite_instance):
+    """In-memory databases must use StaticPool so all threads share one database."""
+    from sqlalchemy.pool import StaticPool
+
+    assert isinstance(sqlite_instance.engine.pool, StaticPool)
+
+
+def test_run_schema_migrations_early_return_with_existing_version_table():
+    """
+    Test that migration early-returns when the version table already exists.
+    This tests the line 57 return in _validate_and_stamp_unversioned_memory_schema.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "versioned-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            # First call on a fresh DB creates schema and stamps version
+            run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "pyrit_memory_alembic_version" in table_names
+
+            with engine.connect() as connection:
+                version = connection.execute(text("SELECT version_num FROM pyrit_memory_alembic_version")).scalar_one()
+            assert version
+
+            run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert "pyrit_memory_alembic_version" in table_names
+
+            with engine.connect() as connection:
+                version_after = connection.execute(
+                    text("SELECT version_num FROM pyrit_memory_alembic_version")
+                ).scalar_one()
+            assert version_after == version
+        finally:
+            engine.dispose()
+
+
+def test_run_schema_migrations_no_memory_tables():
+    """
+    Test that migration early-returns when no memory tables exist.
+    This tests the line 60 return in _validate_and_stamp_unversioned_memory_schema.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "empty-memory.db")
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            run_schema_migrations(engine=engine)
+
+            table_names = set(inspect(engine).get_table_names())
+            assert {
+                "AttackResultEntries",
+                "EmbeddingData",
+                "PromptMemoryEntries",
+                "ScenarioResultEntries",
+                "ScoreEntries",
+                "SeedPromptEntries",
+                "pyrit_memory_alembic_version",
+            }.issubset(table_names)
+        finally:
+            engine.dispose()

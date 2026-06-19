@@ -3,19 +3,31 @@
 
 
 import uuid
-from typing import Literal, Sequence
-from unittest.mock import MagicMock
+from collections.abc import Sequence
+from typing import Literal
 from uuid import uuid4
 
 import pytest
 
-from pyrit.executor.attack.single_turn.prompt_sending import PromptSendingAttack
 from pyrit.memory import MemoryInterface, PromptMemoryEntry
 from pyrit.models import (
+    AtomicAttackIdentifier,
+    AttackResult,
+    ComponentIdentifier,
+    IdentifierFilter,
+    IdentifierType,
     MessagePiece,
     Score,
     SeedPrompt,
 )
+
+
+def _test_scorer_id(name: str = "TestScorer") -> ComponentIdentifier:
+    """Helper to create ComponentIdentifier for tests."""
+    return ComponentIdentifier(
+        class_name=name,
+        class_module="tests.unit.memory",
+    )
 
 
 def test_get_scores_by_attack_id_and_label(
@@ -29,6 +41,19 @@ def test_get_scores_by_attack_id_and_label(
 
     sqlite_instance.add_message_pieces_to_memory(message_pieces=sample_conversations)
 
+    # attack_identifier is no longer stamped on pieces; the deprecated attack_id filter
+    # resolves to an attack's main conversation via persisted AttackResults.
+    attack_strategy_id = ComponentIdentifier(class_name="TestAttack", class_module="test.module")
+    sqlite_instance.add_attack_results_to_memory(
+        attack_results=[
+            AttackResult(
+                conversation_id=sample_conversations[0].conversation_id,
+                objective="test objective",
+                atomic_attack_identifier=AtomicAttackIdentifier.build(attack_identifier=attack_strategy_id),
+            )
+        ]
+    )
+
     score = Score(
         score_value=str(0.8),
         score_value_description="High score",
@@ -36,14 +61,14 @@ def test_get_scores_by_attack_id_and_label(
         score_category=["test"],
         score_rationale="Test score",
         score_metadata={"test": "metadata"},
-        scorer_class_identifier={"__type__": "TestScorer"},
+        scorer_class_identifier=_test_scorer_id("TestScorer"),
         message_piece_id=prompt_id,
     )
 
     sqlite_instance.add_scores_to_memory(scores=[score])
 
     # Fetch the score we just added
-    db_score = sqlite_instance.get_prompt_scores(attack_id=sample_conversations[0].attack_identifier["id"])
+    db_score = sqlite_instance.get_prompt_scores(attack_id=attack_strategy_id.hash)
 
     assert len(db_score) == 1
     assert db_score[0].score_value == score.score_value
@@ -64,7 +89,7 @@ def test_get_scores_by_attack_id_and_label(
     assert db_score[0].score_value == score.score_value
 
     db_score = sqlite_instance.get_prompt_scores(
-        attack_id=sample_conversations[0].attack_identifier["id"],
+        attack_id=attack_strategy_id.hash,
         labels={"x": "y"},
     )
     assert len(db_score) == 0
@@ -98,7 +123,7 @@ def test_add_score_get_score(
         score_category=["test"],
         score_rationale="Test score",
         score_metadata={"test": "metadata"},
-        scorer_class_identifier={"__type__": "TestScorer"},
+        scorer_class_identifier=_test_scorer_id("TestScorer"),
         message_piece_id=prompt_id,
     )
 
@@ -114,14 +139,40 @@ def test_add_score_get_score(
     assert db_score[0].score_category == ["test"]
     assert db_score[0].score_rationale == "Test score"
     assert db_score[0].score_metadata == {"test": "metadata"}
-    assert db_score[0].scorer_class_identifier == {"__type__": "TestScorer"}
+    # scorer_class_identifier is now a ComponentIdentifier object, check the class_name
+    assert db_score[0].scorer_class_identifier.class_name == "TestScorer"
     assert db_score[0].message_piece_id == prompt_id
+
+
+def test_get_prompt_scores_empty_prompt_ids_returns_empty(sqlite_instance: MemoryInterface):
+    prompt_id = uuid4()
+    piece = MessagePiece(
+        id=prompt_id,
+        role="user",
+        original_value="original prompt text",
+        converted_value="Hello, how are you?",
+        conversation_id=str(uuid4()),
+    )
+    sqlite_instance.add_message_pieces_to_memory(message_pieces=[piece])
+
+    score = Score(
+        score_value=str(0.8),
+        score_value_description="High score",
+        score_type="float_scale",
+        score_category=["test"],
+        score_rationale="Test score",
+        score_metadata={"test": "metadata"},
+        scorer_class_identifier=_test_scorer_id("TestScorer"),
+        message_piece_id=prompt_id,
+    )
+    sqlite_instance.add_scores_to_memory(scores=[score])
+
+    assert sqlite_instance.get_prompt_scores(prompt_ids=[]) == []
 
 
 def test_add_score_duplicate_prompt(sqlite_instance: MemoryInterface):
     # Ensure that scores of duplicate prompts are linked back to the original
     original_id = uuid4()
-    attack = PromptSendingAttack(objective_target=MagicMock())
     conversation_id = str(uuid4())
     pieces = [
         MessagePiece(
@@ -131,13 +182,13 @@ def test_add_score_duplicate_prompt(sqlite_instance: MemoryInterface):
             converted_value="Hello, how are you?",
             conversation_id=conversation_id,
             sequence=0,
-            attack_identifier=attack.get_identifier(),
         )
     ]
-    new_attack_id = str(uuid4())
     sqlite_instance.add_message_pieces_to_memory(message_pieces=pieces)
-    sqlite_instance.duplicate_conversation(new_attack_id=new_attack_id, conversation_id=conversation_id)
-    dupe_piece = sqlite_instance.get_message_pieces(attack_id=new_attack_id)[0]
+    sqlite_instance.duplicate_conversation(conversation_id=conversation_id)
+    # Get the duplicated piece (it will have a different conversation_id)
+    all_pieces = sqlite_instance.get_message_pieces()
+    dupe_piece = [p for p in all_pieces if p.id != original_id][0]
     dupe_id = dupe_piece.id
     assert dupe_id is not None, "Dupe ID should not be None"
 
@@ -151,7 +202,7 @@ def test_add_score_duplicate_prompt(sqlite_instance: MemoryInterface):
         score_category=["test"],
         score_rationale="Test score",
         score_metadata={"test": "metadata"},
-        scorer_class_identifier={"__type__": "TestScorer"},
+        scorer_class_identifier=_test_scorer_id("TestScorer"),
         message_piece_id=dupe_id,
     )
     sqlite_instance.add_scores_to_memory(scores=[score])
@@ -171,6 +222,7 @@ def test_get_scores_by_memory_labels(sqlite_instance: MemoryInterface):
             converted_value="Hello, how are you?",
             sequence=0,
             labels={"sample": "label"},
+            conversation_id=str(uuid4()),
         )
     ]
     sqlite_instance.add_message_pieces_to_memory(message_pieces=pieces)
@@ -182,7 +234,7 @@ def test_get_scores_by_memory_labels(sqlite_instance: MemoryInterface):
         score_category=["test"],
         score_rationale="Test score",
         score_metadata={"test": "metadata"},
-        scorer_class_identifier={"__type__": "TestScorer"},
+        scorer_class_identifier=_test_scorer_id("TestScorer"),
         message_piece_id=prompt_id,
     )
     sqlite_instance.add_scores_to_memory(scores=[score])
@@ -201,15 +253,100 @@ def test_get_scores_by_memory_labels(sqlite_instance: MemoryInterface):
     assert db_score[0].message_piece_id == prompt_id
 
 
-@pytest.mark.asyncio
 async def test_get_seeds_no_filters(sqlite_instance: MemoryInterface):
     seed_prompts = [
         SeedPrompt(value="prompt1", dataset_name="dataset1", data_type="text"),
         SeedPrompt(value="prompt2", dataset_name="dataset2", data_type="text"),
     ]
-    await sqlite_instance.add_seeds_to_memory_async(prompts=seed_prompts, added_by="test")
+    await sqlite_instance.add_seeds_to_memory_async(seeds=seed_prompts, added_by="test")
 
     result = sqlite_instance.get_seeds()
     assert len(result) == 2
     assert result[0].value == "prompt1"
     assert result[1].value == "prompt2"
+
+
+def test_get_scores_by_scorer_identifier_filter(
+    sqlite_instance: MemoryInterface,
+    sample_conversation_entries: Sequence[PromptMemoryEntry],
+):
+    prompt_id = sample_conversation_entries[0].id
+    sqlite_instance._insert_entries(entries=sample_conversation_entries)
+
+    score_a = Score(
+        score_value="0.9",
+        score_value_description="High",
+        score_type="float_scale",
+        score_category=["cat_a"],
+        score_rationale="Rationale A",
+        score_metadata={},
+        scorer_class_identifier=_test_scorer_id("ScorerAlpha"),
+        message_piece_id=prompt_id,
+    )
+    score_b = Score(
+        score_value="0.1",
+        score_value_description="Low",
+        score_type="float_scale",
+        score_category=["cat_b"],
+        score_rationale="Rationale B",
+        score_metadata={},
+        scorer_class_identifier=_test_scorer_id("ScorerBeta"),
+        message_piece_id=prompt_id,
+    )
+
+    sqlite_instance.add_scores_to_memory(scores=[score_a, score_b])
+
+    # Filter by exact class_name match
+    results = sqlite_instance.get_scores(
+        identifier_filters=[
+            IdentifierFilter(
+                identifier_type=IdentifierType.SCORER,
+                property_path="$.class_name",
+                value="ScorerAlpha",
+                partial_match=False,
+            )
+        ],
+    )
+    assert len(results) == 1
+    assert results[0].score_value == "0.9"
+
+    # Filter by partial class_name match
+    results = sqlite_instance.get_scores(
+        identifier_filters=[
+            IdentifierFilter(
+                identifier_type=IdentifierType.SCORER,
+                property_path="$.class_name",
+                value="Scorer",
+                partial_match=True,
+            )
+        ],
+    )
+    assert len(results) == 2
+
+    # Filter by hash
+    scorer_hash = score_a.scorer_class_identifier.hash
+    results = sqlite_instance.get_scores(
+        identifier_filters=[
+            IdentifierFilter(
+                identifier_type=IdentifierType.SCORER,
+                property_path="$.hash",
+                value=scorer_hash,
+                partial_match=False,
+            )
+        ],
+    )
+    assert len(results) == 1
+    assert results[0].score_value == "0.9"
+
+    # No match
+    results = sqlite_instance.get_scores(
+        identifier_filters=[
+            IdentifierFilter(
+                identifier_type=IdentifierType.SCORER,
+                property_path="$.class_name",
+                value="NonExistent",
+                partial_match=False,
+            )
+        ],
+    )
+    assert len(results) == 0

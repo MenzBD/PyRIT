@@ -1,10 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from typing import Optional
 
 from pyrit.analytics.text_matching import ExactTextMatching, TextMatching
-from pyrit.models import MessagePiece, Score
+from pyrit.models import ComponentIdentifier, MessagePiece, Score
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
 from pyrit.score.true_false.true_false_score_aggregator import (
     TrueFalseAggregatorFunc,
@@ -14,45 +13,64 @@ from pyrit.score.true_false.true_false_scorer import TrueFalseScorer
 
 
 class SubStringScorer(TrueFalseScorer):
-    """Scorer that checks if a given substring is present in the text.
+    """
+    Scorer that checks if a given substring is present in the text.
 
     This scorer performs substring matching using a configurable text matching strategy.
     Supports both exact substring matching and approximate matching.
     """
 
-    _default_validator: ScorerPromptValidator = ScorerPromptValidator(supported_data_types=["text"])
+    _DEFAULT_VALIDATOR: ScorerPromptValidator = ScorerPromptValidator(supported_data_types=["text"])
 
     def __init__(
         self,
         *,
         substring: str,
-        text_matcher: Optional[TextMatching] = None,
-        categories: Optional[list[str]] = None,
+        text_matcher: TextMatching | None = None,
+        categories: list[str] | None = None,
         aggregator: TrueFalseAggregatorFunc = TrueFalseScoreAggregator.OR,
-        validator: Optional[ScorerPromptValidator] = None,
+        validator: ScorerPromptValidator | None = None,
     ) -> None:
-        """Initialize the SubStringScorer.
+        """
+        Initialize the SubStringScorer.
 
         Args:
             substring (str): The substring to search for in the text.
-            text_matcher (Optional[TextMatching]): The text matching strategy to use.
+            text_matcher (TextMatching | None): The text matching strategy to use.
                 Defaults to ExactTextMatching with case_sensitive=False.
-            categories (Optional[list[str]]): Optional list of categories for the score. Defaults to None.
+            categories (list[str] | None): Optional list of categories for the score. Defaults to None.
             aggregator (TrueFalseAggregatorFunc): The aggregator function to use.
                 Defaults to TrueFalseScoreAggregator.OR.
-            validator (Optional[ScorerPromptValidator]): Custom validator. Defaults to None.
+            validator (ScorerPromptValidator | None): Custom validator. Defaults to None.
         """
-        super().__init__(score_aggregator=aggregator, validator=validator or self._default_validator)
         self._substring = substring
         self._text_matcher = text_matcher if text_matcher else ExactTextMatching(case_sensitive=False)
         self._score_categories = categories if categories else []
 
-    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: Optional[str] = None) -> list[Score]:
-        """Score the given message piece based on presence of the substring.
+        super().__init__(score_aggregator=aggregator, validator=validator or self._DEFAULT_VALIDATOR)
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier for this scorer.
+
+        Returns:
+            ComponentIdentifier: The identifier for this scorer.
+        """
+        return self._create_identifier(
+            params={
+                "substring": self._substring,
+                "text_matcher": self._text_matcher.__class__.__name__,
+            },
+            score_aggregator=self._score_aggregator.__name__,  # type: ignore[ty:unresolved-attribute]
+        )
+
+    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: str | None = None) -> list[Score]:
+        """
+        Score the given message piece based on presence of the substring.
 
         Args:
             message_piece (MessagePiece): The message piece to score.
-            objective (Optional[str]): The objective to evaluate against. Defaults to None.
+            objective (str | None): The objective to evaluate against. Defaults to None.
                 Currently not used for this scorer.
 
         Returns:
@@ -61,7 +79,7 @@ class SubStringScorer(TrueFalseScorer):
         """
         substring_present = self._text_matcher.is_match(target=self._substring, text=message_piece.converted_value)
 
-        score = [
+        return [
             Score(
                 score_value=str(substring_present),
                 score_value_description="",
@@ -74,5 +92,3 @@ class SubStringScorer(TrueFalseScorer):
                 objective=objective,
             )
         ]
-
-        return score

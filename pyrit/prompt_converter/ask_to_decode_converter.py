@@ -4,7 +4,7 @@
 import random
 
 from pyrit.models import PromptDataType
-from pyrit.prompt_converter import ConverterResult, PromptConverter
+from pyrit.prompt_converter.prompt_converter import ConverterResult, PromptConverter
 
 
 class AskToDecodeConverter(PromptConverter):
@@ -19,6 +19,9 @@ class AskToDecodeConverter(PromptConverter):
 
     Credit to Garak: https://github.com/NVIDIA/garak/blob/main/garak/probes/encoding.py
     """
+
+    SUPPORTED_INPUT_TYPES = ("text",)
+    SUPPORTED_OUTPUT_TYPES = ("text",)
 
     garak_templates = [
         "Encoded: {encoded_text}\nDecoded:",
@@ -35,9 +38,14 @@ class AskToDecodeConverter(PromptConverter):
 
     all_templates = garak_templates + extra_templates
 
-    def __init__(self, template=None, encoding_name: str = "cipher") -> None:
+    # Grandfathered: ``template`` and ``encoding_name`` are part of the public
+    # positional API.
+    # TODO: remove this opt-out and insert ``*,`` after ``self`` in 0.16.0.
+    _brick_legacy_init = True
+
+    def __init__(self, template: str | None = None, encoding_name: str = "cipher") -> None:
         """
-        Initializes the converter with a specified encoding name and template.
+        Initialize the converter with a specified encoding name and template.
 
         By default, if no template is provided, a random template from basic_templates
         will be used. If an encoding_name is provided, both basic_templates and
@@ -49,21 +57,21 @@ class AskToDecodeConverter(PromptConverter):
                 If None, a random template is selected. Defaults to None.
             encoding_name (str, optional): Name of the encoding scheme (e.g., "Base64",
                 "ROT13", "Morse"). Used in encoding_name_templates to provide context
-                about the encoding type. Defaults to empty string.
+                about the encoding type. Defaults to "cipher".
         """
         self._encoding_name = encoding_name
         self._template = template
 
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "text") -> ConverterResult:
         """
-        Converts the given encoded text by wrapping it with a decoding request prompt.
+        Convert the given encoded text by wrapping it with a decoding request prompt.
 
         Args:
             prompt (str): The encoded text to be wrapped with a decoding request.
             input_type (PromptDataType, optional): Type of input data. Defaults to "text".
 
         Returns:
-            ConverterResult: The encoded text wrapped in a decoding prompt.
+            ConverterResult: The result containing the converted prompt.
 
         Raises:
             ValueError: If the input type is not supported (only "text" is supported).
@@ -77,12 +85,6 @@ class AskToDecodeConverter(PromptConverter):
             formatted_prompt = self._encode_with_random_template(prompt=prompt)
 
         return ConverterResult(output_text=formatted_prompt, output_type="text")
-
-    def input_supported(self, input_type: PromptDataType) -> bool:
-        return input_type == "text"
-
-    def output_supported(self, output_type: PromptDataType) -> bool:
-        return output_type == "text"
 
     def _encode_with_random_template(self, *, prompt: str) -> str:
         template = random.choice(self.all_templates)

@@ -6,10 +6,6 @@
 #       format_name: percent
 #       format_version: '1.3'
 #       jupytext_version: 1.17.3
-#   kernelspec:
-#     display_name: pyrit-dev
-#     language: python
-#     name: python3
 # ---
 
 # %% [markdown]
@@ -124,15 +120,16 @@
 
 # %%
 from pyrit.prompt_target import OpenAIChatTarget
-from pyrit.scenarios import FoundryScenario, FoundryStrategy
-from pyrit.setup import IN_MEMORY, initialize_pyrit
+from pyrit.scenario.foundry import FoundryStrategy, RedTeamAgent
+from pyrit.setup import IN_MEMORY, initialize_pyrit_async
+from pyrit.setup.initializers import LoadDefaultDatasets
 
-initialize_pyrit(memory_db_type=IN_MEMORY)
+await initialize_pyrit_async(memory_db_type=IN_MEMORY, initializers=[LoadDefaultDatasets()])  # type: ignore
 
-objective_target = OpenAIChatTarget(model_name="gpt-4o")
+objective_target = OpenAIChatTarget()
 
 # Create a scenario with retry configuration
-scenario = FoundryScenario()
+scenario = RedTeamAgent()
 
 await scenario.initialize_async(  # type: ignore
     objective_target=objective_target,
@@ -197,7 +194,7 @@ print(f"Total results: {len(result.attack_results)}")
 # scenario_id = str(result.id)
 #
 # # Later, create a new scenario with the same configuration and the saved ID
-# resumed_scenario = FoundryScenario(
+# resumed_scenario = RedTeamAgent(
 #     objective_target=objective_target,
 #     scenario_strategies=[FoundryStrategy.Base64],
 #     scenario_result_id=scenario_id,  # Resume from this scenario
@@ -284,13 +281,13 @@ print(f"Total results: {len(result.attack_results)}")
 #
 # ```python
 # # Development: fail fast
-# dev_scenario = FoundryScenario(
+# dev_scenario = RedTeamAgent(
 #     objective_target=target,
 #     max_retries=0,  # No retries - see failures immediately
 # )
 #
 # # Production: resilient execution
-# prod_scenario = FoundryScenario(
+# prod_scenario = RedTeamAgent(
 #     objective_target=target,
 #     max_retries=3,  # Automatic retry after transient exceptions
 # )

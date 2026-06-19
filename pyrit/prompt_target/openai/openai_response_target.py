@@ -3,31 +3,39 @@
 
 import json
 import logging
+from collections.abc import Awaitable, Callable, MutableSequence
 from enum import Enum
 from typing import (
     Any,
-    Awaitable,
-    Callable,
-    Dict,
-    List,
-    MutableSequence,
-    Optional,
+    Literal,
+    cast,
 )
 
-from pyrit.common import convert_local_image_to_data_url
+from openai.types.shared import ReasoningEffort
+
 from pyrit.exceptions import (
     EmptyResponseException,
     PyritException,
-    handle_bad_request_exception,
+    pyrit_target_retry,
 )
+from pyrit.memory.storage import convert_local_image_to_data_url_async
 from pyrit.models import (
+    ComponentIdentifier,
     Message,
     MessagePiece,
     PromptDataType,
     PromptResponseError,
 )
-from pyrit.prompt_target import limit_requests_per_minute
-from pyrit.prompt_target.openai.openai_chat_target_base import OpenAIChatTargetBase
+from pyrit.prompt_target.common.json_response_config import _JsonResponseConfig
+from pyrit.prompt_target.common.target_capabilities import TargetCapabilities
+from pyrit.prompt_target.common.target_configuration import TargetConfiguration
+from pyrit.prompt_target.common.utils import (
+    limit_requests_per_minute,
+    validate_temperature,
+    validate_top_p,
+)
+from pyrit.prompt_target.openai.openai_error_handling import _is_content_filter_error
+from pyrit.prompt_target.openai.openai_target import OpenAITarget
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +45,8 @@ ToolExecutor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class MessagePieceType(str, Enum):
+    """Enumeration of different types of message pieces."""
+
     MESSAGE = "message"
     REASONING = "reasoning"
     IMAGE_GENERATION_CALL = "image_generation_call"
@@ -51,9 +61,9 @@ class MessagePieceType(str, Enum):
     MCP_APPROVAL_REQUEST = "mcp_approval_request"
 
 
-class OpenAIResponseTarget(OpenAIChatTargetBase):
+class OpenAIResponseTarget(OpenAITarget):
     """
-    This class enables communication with endpoints that support the OpenAI Response API.
+    Enables communication with endpoints that support the OpenAI Response API.
 
     This works with models such as o1, o3, and o4-mini.
     Depending on the endpoint this allows for a variety of inputs, outputs, and tool calls.
@@ -61,23 +71,47 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
     https://platform.openai.com/docs/api-reference/responses/create
     """
 
+    _DEFAULT_CONFIGURATION: TargetConfiguration = TargetConfiguration(
+        capabilities=TargetCapabilities(
+            supports_multi_turn=True,
+            supports_editable_history=True,
+            supports_json_output=True,
+            supports_multi_message_pieces=True,
+            supports_system_prompt=True,
+            input_modalities=frozenset(
+                {
+                    frozenset(["text"]),
+                    frozenset(["text", "image_path"]),
+                    frozenset(["function_call"]),
+                    frozenset(["tool_call"]),
+                    frozenset(["function_call_output"]),
+                    frozenset(["reasoning"]),
+                }
+            ),
+        )
+    )
+
     def __init__(
         self,
         *,
-        custom_functions: Optional[Dict[str, ToolExecutor]] = None,
-        max_output_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        extra_body_parameters: Optional[dict[str, Any]] = None,
+        custom_functions: dict[str, ToolExecutor] | None = None,
+        max_output_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        reasoning_summary: Literal["auto", "concise", "detailed"] | None = None,
+        extra_body_parameters: dict[str, Any] | None = None,
         fail_on_missing_function: bool = False,
-        **kwargs,
-    ):
+        custom_configuration: TargetConfiguration | None = None,
+        **kwargs: Any,
+    ) -> None:
         """
-        Initializes the OpenAIResponseTarget with the provided parameters.
+        Initialize the OpenAIResponseTarget with the provided parameters.
 
         Args:
             custom_functions: Mapping of user-defined function names (e.g., "my_func").
-            model_name (str, Optional): The name of the model.
+            model_name (str, Optional): The name of the model (or deployment name in Azure).
+                If no value is provided, the OPENAI_RESPONSES_MODEL environment variable will be used.
             endpoint (str, Optional): The target URL for the OpenAI service.
             api_key (str, Optional): The API key for accessing the Azure OpenAI service.
                 Defaults to the OPENAI_RESPONSES_KEY environment variable.
@@ -92,43 +126,51 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
                 randomness of the response.
             top_p (float, Optional): The top-p parameter for controlling the diversity of the
                 response.
-            is_json_supported (bool, Optional): If True, the target will support formatting responses as JSON by
-                setting the response_format header. Official OpenAI models all support this, but if you are using
-                this target with different models, is_json_supported should be set correctly to avoid issues when
-                using adversarial infrastructure (e.g. Crescendo scorers will set this flag).
+            reasoning_effort (ReasoningEffort, Optional): Controls how much reasoning the model
+                performs. Accepts "minimal", "low", "medium", or "high". Lower effort
+                favors speed and lower cost; higher effort favors thoroughness. Defaults to None
+                (uses model default, typically "medium").
+            reasoning_summary (Literal["auto", "concise", "detailed"], Optional): Controls
+                whether a summary of the model's reasoning is included in the response.
+                Defaults to None (no summary).
             extra_body_parameters (dict, Optional): Additional parameters to be included in the request body.
             fail_on_missing_function: if True, raise when a function_call references
                 an unknown function or does not output a function; if False, return a structured error so we can
                 wrap it as function_call_output and let the model potentially recover
                 (e.g., pick another tool or ask for clarification).
-            httpx_client_kwargs (dict, Optional): Additional kwargs to be passed to the
-                httpx.AsyncClient() constructor.
-                For example, to specify a 3 minute timeout: httpx_client_kwargs={"timeout": 180}
+            custom_configuration (TargetConfiguration, Optional): Override the default configuration for
+                this target instance. Defaults to None.
+            **kwargs: Additional keyword arguments passed to the parent OpenAITarget class.
+             httpx_client_kwargs (dict, Optional): Additional kwargs to be passed to the ``httpx.AsyncClient()``
+                constructor. For example, to specify a 3 minute timeout: ``httpx_client_kwargs={"timeout": 180}``
+
 
         Raises:
             PyritException: If the temperature or top_p values are out of bounds.
             ValueError: If the temperature is not between 0 and 2 (inclusive).
             ValueError: If the top_p is not between 0 and 1 (inclusive).
-            ValueError: If both `max_output_tokens` and `max_tokens` are provided.
             RateLimitException: If the target is rate-limited.
             httpx.HTTPStatusError: If the request fails with a 400 Bad Request or 429 Too Many Requests error.
             json.JSONDecodeError: If the response from the target is not valid JSON.
             Exception: If the request fails for any other reason.
         """
-        super().__init__(temperature=temperature, top_p=top_p, **kwargs)
+        super().__init__(custom_configuration=custom_configuration, **kwargs)
+
+        # Validate temperature and top_p
+        validate_temperature(temperature)
+        validate_top_p(top_p)
+
+        self._temperature = temperature
+        self._top_p = top_p
         self._max_output_tokens = max_output_tokens
 
-        response_url_patterns = [r"/responses"]
-        self._warn_if_irregular_endpoint(response_url_patterns)
-
-        # Reasoning parameters are not yet supported by PyRIT.
-        # See https://platform.openai.com/docs/api-reference/responses/create#responses-create-reasoning
-        # for more information.
+        self._reasoning_effort = reasoning_effort
+        self._reasoning_summary = reasoning_summary
 
         self._extra_body_parameters = extra_body_parameters
 
         # Per-instance tool/func registries:
-        self._custom_functions: Dict[str, ToolExecutor] = custom_functions or {}
+        self._custom_functions: dict[str, ToolExecutor] = custom_functions or {}
         self._fail_on_missing_function: bool = fail_on_missing_function
 
         # Extract the grammar 'tool' if one is present
@@ -145,32 +187,41 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
                     logger.debug("Detected grammar tool: %s", tool_name)
                     self._grammar_name = tool_name
 
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier with OpenAI response-specific parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this target instance.
+        """
+        return self._create_identifier(
+            params={
+                "temperature": self._temperature,
+                "top_p": self._top_p,
+                "max_output_tokens": self._max_output_tokens,
+                "reasoning_effort": self._reasoning_effort,
+                "reasoning_summary": self._reasoning_summary,
+                "extra_body_parameters": self._extra_body_parameters,
+            },
+        )
+
     def _set_openai_env_configuration_vars(self) -> None:
         self.model_name_environment_variable = "OPENAI_RESPONSES_MODEL"
         self.endpoint_environment_variable = "OPENAI_RESPONSES_ENDPOINT"
         self.api_key_environment_variable = "OPENAI_RESPONSES_KEY"
-        return
 
-    # Helpers kept on the class for reuse + testability
-    def _flush_message(self, role: Optional[str], content: List[Dict[str, Any]], output: List[Dict[str, Any]]) -> None:
-        """
-        Append a role message and clear the working buffer.
+    def _get_target_api_paths(self) -> list[str]:
+        """Return API paths that should not be in the URL."""
+        return ["/responses", "/v1/responses"]
 
-        Args:
-            role: Role to emit ("user" / "assistant" / "system").
-            content: Accumulated content items for the role.
-            output: Destination list to append the message to. It holds a list of dicts containing
-                key-value pairs representing the role and content.
+    def _get_provider_examples(self) -> dict[str, str]:
+        """Return provider-specific example URLs."""
+        return {
+            ".openai.azure.com": "https://{resource}.openai.azure.com/openai/v1",
+            "api.openai.com": "https://api.openai.com/v1",
+        }
 
-        Returns:
-            None. Mutates `output` (append) and `content` (clear).
-        """
-        if role and content:
-            output.append({"role": role, "content": list(content)})
-            content.clear()
-        return
-
-    async def _construct_input_item_from_piece(self, piece: MessagePiece) -> Dict[str, Any]:
+    async def _construct_input_item_from_piece_async(self, piece: MessagePiece) -> dict[str, Any]:
         """
         Convert a single inline piece into a Responses API content item.
 
@@ -186,21 +237,24 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
         """
         if piece.converted_value_data_type == "text":
             return {
-                "type": "input_text" if piece.role in ["developer", "user"] else "output_text",
+                "type": "input_text" if piece.api_role in ["developer", "user"] else "output_text",
                 "text": piece.converted_value,
             }
         if piece.converted_value_data_type == "image_path":
-            data_url = await convert_local_image_to_data_url(piece.converted_value)
+            data_url = await convert_local_image_to_data_url_async(piece.converted_value)
             return {"type": "input_image", "image_url": {"url": data_url}}
         raise ValueError(f"Unsupported piece type for inline content: {piece.converted_value_data_type}")
 
-    async def _build_input_for_multi_modal_async(self, conversation: MutableSequence[Message]) -> List[Dict[str, Any]]:
+    async def _build_input_for_multi_modal_async(self, conversation: MutableSequence[Message]) -> list[dict[str, Any]]:
         """
         Build the Responses API `input` array.
 
         Groups inline content (text/images) into role messages and emits tool artifacts
         (reasoning, function_call, function_call_output, web_search_call, etc.) as top-level
         items — per the Responses API schema.
+
+        Each Message is processed as a complete unit. All MessagePieces within a Message
+        share the same role, so content is accumulated and appended once per Message.
 
         Args:
             conversation: Ordered list of user/assistant/tool artifacts to serialize.
@@ -214,7 +268,7 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
         if not conversation:
             raise ValueError("Conversation cannot be empty")
 
-        input_items: List[Dict[str, Any]] = []
+        input_items: list[dict[str, Any]] = []
 
         for msg_idx, message in enumerate(conversation):
             pieces = message.message_pieces
@@ -223,45 +277,69 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
                     f"Failed to process conversation message at index {msg_idx}: Message contains no message pieces"
                 )
 
-            # System message -> single role message (remapped to developer later)
-            if pieces[0].role == "system":
-                if len(pieces) != 1:
-                    raise ValueError("System messages must have exactly one piece.")
-                input_items.append(
-                    {
-                        "role": "system",
-                        "content": [{"type": "input_text", "text": pieces[0].converted_value}],
-                    }
-                )
+            # System message (remapped to developer)
+            if pieces[0].api_role == "system":
+                system_content = [{"type": "input_text", "text": piece.converted_value} for piece in pieces]
+                input_items.append({"role": "developer", "content": system_content})
                 continue
 
-            role: Optional[str] = None
-            content: List[Dict[str, Any]] = []
+            # All pieces in a Message share the same role
+            role = pieces[0].api_role
+            content: list[dict[str, Any]] = []
 
             for piece in pieces:
                 dtype = piece.converted_value_data_type
 
-                # Inline, role-batched content
-                if dtype in {"text", "image_path"}:
-                    if role is None:
-                        role = piece.role
-                    elif piece.role != role:
-                        self._flush_message(role, content, input_items)
-                        role = piece.role
-
-                    content.append(await self._construct_input_item_from_piece(piece))
+                # Skip reasoning - it's stored in memory but not sent back to API
+                if dtype == "reasoning":
                     continue
 
-                # Top-level artifacts (flush any pending role content first)
-                self._flush_message(role, content, input_items)
-                role = None
+                # Inline content (text/images) - accumulate in content list
+                if dtype in {"text", "image_path"}:
+                    content.append(await self._construct_input_item_from_piece_async(piece))
+                    continue
 
-                if dtype not in {"reasoning", "function_call", "function_call_output", "tool_call"}:
+                # Top-level artifacts - emit as standalone items
+                if dtype not in {"function_call", "function_call_output", "tool_call"}:
                     raise ValueError(f"Unsupported data type '{dtype}' in message index {msg_idx}")
 
-                if dtype in {"reasoning", "function_call", "tool_call"}:
-                    # Already in API shape in original_value
-                    input_items.append(json.loads(piece.original_value))
+                if dtype in {"function_call", "tool_call"}:
+                    # Parse the stored JSON and filter to only API-expected fields
+                    stored = json.loads(piece.original_value)
+                    if dtype == "function_call":
+                        # Only include fields the API expects for function_call
+                        input_items.append(
+                            {
+                                "type": stored["type"],
+                                "call_id": stored["call_id"],
+                                "name": stored["name"],
+                                "arguments": stored["arguments"],
+                            }
+                        )
+                    elif dtype == "tool_call":
+                        # Filter tool_call fields based on type
+                        tool_type = stored.get("type")
+                        if tool_type == "web_search_call":
+                            # Web search call structure
+                            input_items.append(
+                                {
+                                    "type": stored["type"],
+                                    "call_id": stored.get("call_id"),
+                                    "query": stored.get("query"),
+                                }
+                            )
+                        else:
+                            # For unknown tool types, try to include only known fields
+                            filtered = {"type": stored["type"]}
+                            if "call_id" in stored:
+                                filtered["call_id"] = stored["call_id"]
+                            if "query" in stored:
+                                filtered["query"] = stored["query"]
+                            if "name" in stored:
+                                filtered["name"] = stored["name"]
+                            if "arguments" in stored:
+                                filtered["arguments"] = stored["arguments"]
+                            input_items.append(filtered)
 
                 if dtype == "function_call_output":
                     payload = json.loads(piece.original_value)
@@ -277,28 +355,31 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
                         }
                     )
 
-            # Flush trailing role content for this message
-            self._flush_message(role, content, input_items)
+            # Append accumulated inline content for this message
+            if content:
+                input_items.append({"role": role, "content": content})
 
-        # Responses API maps system -> developer
-        self._translate_roles(conversation=input_items)
         return input_items
 
-    def _translate_roles(self, conversation: List[Dict[str, Any]]) -> None:
-        # The "system" role is mapped to "developer" in the OpenAI Response API.
-        for request in conversation:
-            if request.get("role") == "system":
-                request["role"] = "developer"
-        return
-
-    async def _construct_request_body(self, conversation: MutableSequence[Message], is_json_response: bool) -> dict:
+    async def _construct_request_body_async(
+        self, *, conversation: MutableSequence[Message], json_config: _JsonResponseConfig
+    ) -> dict[str, Any]:
         """
         Construct the request body to send to the Responses API.
 
         NOTE: The Responses API uses top-level `response_format` for JSON,
         not `text.format` from the old Chat Completions style.
+
+        Args:
+            conversation: The full conversation history.
+            json_config: Specification for JSON formatting.
+
+        Returns:
+            dict: The request body to send to the Responses API.
         """
         input_items = await self._build_input_for_multi_modal_async(conversation)
+
+        text_format = self._build_text_format(json_config=json_config)
 
         body_parameters = {
             "model": self._model_name,
@@ -308,7 +389,8 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
             "stream": False,
             "input": input_items,
             # Correct JSON response format per Responses API
-            "response_format": {"type": "json_object"} if is_json_response else None,
+            "text": text_format,
+            "reasoning": self._build_reasoning_config(),
         }
 
         if self._extra_body_parameters:
@@ -317,142 +399,298 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
         # Filter out None values
         return {k: v for k, v in body_parameters.items() if v is not None}
 
-    def _construct_message_from_openai_json(
-        self,
-        *,
-        open_ai_str_response: str,
-        message_piece: MessagePiece,
-    ) -> Message:
+    def _build_reasoning_config(self) -> dict[str, Any] | None:
         """
-        Parse the Responses API JSON into internal Message.
+        Build the reasoning configuration dict for the Responses API.
+
+        Returns:
+            dict[str, Any] | None: The reasoning config, or None if neither effort nor summary is set.
         """
-        response: dict[str, Any]
+        if self._reasoning_effort is None and self._reasoning_summary is None:
+            return None
+
+        reasoning: dict[str, Any] = {}
+        if self._reasoning_effort is not None:
+            reasoning["effort"] = self._reasoning_effort
+        if self._reasoning_summary is not None:
+            reasoning["summary"] = self._reasoning_summary
+        return reasoning
+
+    def _build_text_format(self, json_config: _JsonResponseConfig) -> dict[str, Any] | None:
+        if not json_config.enabled:
+            return None
+
+        if json_config.json_schema:
+            return {
+                "format": {
+                    "type": "json_schema",
+                    "name": json_config.schema_name,
+                    "schema": json_config.json_schema,
+                    "strict": json_config.strict,
+                }
+            }
+
+        logger.info("Using json_object format without schema - consider providing a schema for better results")
+        return {"format": {"type": "json_object"}}
+
+    def _check_content_filter(self, response: Any) -> bool:
+        """
+        Check if a Response API response has a content filter error.
+
+        The Responses API signals content filtering in two ways:
+        1. Via ``response.error`` with a content_filter code (older/alternative path)
+        2. Via ``response.status == "incomplete"`` with
+           ``response.incomplete_details.reason == "content_filter"``
+
+        Args:
+            response: A Response object from the OpenAI SDK.
+
+        Returns:
+            True if content was filtered, False otherwise.
+        """
+        # Path 1: error-based detection (e.g., error.code == "content_filter")
+        if hasattr(response, "error") and response.error is not None:
+            response_dict = response.model_dump()
+            if _is_content_filter_error(response_dict):
+                return True
+
+        # Path 2: incomplete status with content_filter reason
+        if getattr(response, "status", None) == "incomplete":
+            incomplete_details = getattr(response, "incomplete_details", None)
+            if incomplete_details and getattr(incomplete_details, "reason", None) == "content_filter":
+                return True
+
+        return False
+
+    def _extract_partial_content(self, response: Any) -> str | None:
+        """
+        Extract partial content from a Response API response that was content-filtered.
+
+        When the Responses API triggers a content filter, the response may contain partial
+        output in ``response.output`` message sections with ``status='completed'``. Messages
+        with ``status='incomplete'`` typically contain refusal text and are excluded.
+
+        Args:
+            response: A Response object from the OpenAI SDK.
+
+        Returns:
+            The partial text content from completed output messages, or None if no
+            partial content was generated.
+        """
         try:
-            response = json.loads(open_ai_str_response)
-        except json.JSONDecodeError as e:
-            response_start = open_ai_str_response[:100]
-            raise PyritException(
-                message=f"Failed to parse response from model {self._model_name} at {self._endpoint} as JSON.\n"
-                f"Response: {response_start}\nFull error: {e}"
+            if not hasattr(response, "output") or not response.output:
+                return None
+            parts: list[str] = []
+            for section in response.output:
+                if getattr(section, "type", None) != MessagePieceType.MESSAGE:
+                    continue
+                # Only include completed messages — incomplete messages contain refusal text
+                if getattr(section, "status", None) != "completed":
+                    continue
+                content = getattr(section, "content", None)
+                if content and len(content) > 0:
+                    text = getattr(content[0], "text", None)
+                    if text:
+                        parts.append(text)
+            return "\n".join(parts) if parts else None
+        except (AttributeError, IndexError, TypeError):
+            return None
+
+    def _validate_response(self, response: Any, request: MessagePiece) -> Message | None:
+        """
+        Validate a Response API response for errors.
+
+        Checks for:
+        - Error responses (excluding content filtering which is checked separately)
+        - Invalid status
+        - Empty output
+
+        Args:
+            response: The Response object from the OpenAI SDK.
+            request: The original request MessagePiece.
+
+        Returns:
+            None if valid, does not return Message for content filter (handled by _check_content_filter).
+
+        Raises:
+            PyritException: For unexpected response structures or errors.
+            EmptyResponseException: When the API returns no valid output.
+        """
+        # Check for error response - error is a ResponseError object or None
+        # (content_filter is handled by _check_content_filter)
+        if response.error is not None and response.error.code != "content_filter":
+            raise PyritException(message=f"Response error: {response.error.code} - {response.error.message}")
+
+        # Check status - should be "completed" for successful responses
+        if response.status != "completed":
+            raise PyritException(message=f"Unexpected status: {response.status}")
+
+        # Check for empty output
+        if not response.output:
+            logger.error("The response returned no valid output.")
+            raise EmptyResponseException(message="The response returned an empty response.")
+
+        return None
+
+    async def _construct_message_from_response_async(self, response: Any, request: MessagePiece) -> Message:
+        """
+        Construct a Message from a Response API response.
+
+        Args:
+            response: The Response object from OpenAI SDK.
+            request: The original request MessagePiece.
+
+        Returns:
+            Message: Constructed message with extracted content from output sections.
+        """
+        # Extract and parse message pieces from validated output sections
+        extracted_response_pieces: list[MessagePiece] = []
+        for section in response.output:
+            piece = self._parse_response_output_section(
+                section=section,
+                message_piece=request,
+                error=None,  # error is already handled in validation
             )
-
-        status = response.get("status")
-        error = response.get("error")
-
-        # Handle error responses
-        if status is None:
-            if error and error.get("code", "") == "content_filter":
-                # TODO validate that this is correct with AOAI
-                # Content filter with status 200 indicates that the model output was filtered
-                # https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/content-filter
-                return handle_bad_request_exception(
-                    response_text=open_ai_str_response, request=message_piece, error_code=200, is_content_filter=True
-                )
-            else:
-                raise PyritException(message=f"Unexpected response format: {response}. Expected 'status' key.")
-        elif status != "completed" or error is not None:
-            raise PyritException(message=f"Status {status} and error {error} from response: {response}")
-
-        # Extract message pieces from the response object
-        extracted_response_pieces: List[MessagePiece] = []
-        for section in response.get("output", []):
-            piece = self._parse_response_output_section(section=section, message_piece=message_piece, error=error)
             if piece is None:
                 continue
             extracted_response_pieces.append(piece)
 
-        if not extracted_response_pieces:
-            raise PyritException(message="No valid message pieces found in the response.")
-
         return Message(message_pieces=extracted_response_pieces)
 
     @limit_requests_per_minute
-    async def send_prompt_async(self, *, message: Message) -> Message:
+    @pyrit_target_retry
+    async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
         """
-        Send prompt, handle agentic tool calls (function_call), return assistant output.
+        Send prompt, handle agentic tool calls (function_call), return all messages.
+
+        The Responses API supports structured outputs and tool execution. This method handles both:
+        - Simple text/reasoning responses
+        - Agentic tool-calling loops that may require multiple back-and-forth exchanges
 
         Args:
-            message: The initial prompt from the user.
+            normalized_conversation (list[Message]): The full conversation
+                (history + current message) after running the normalization
+                pipeline. The current message is the last element.
 
         Returns:
-            The final Message with the assistant's answer.
+            List of messages generated during the interaction (assistant responses and tool messages).
+            The normalizer will persist all of these to memory.
         """
-        conversation: MutableSequence[Message] = [message]
-        send_prompt_async = super().send_prompt_async  # bind for inner function
+        message = normalized_conversation[-1]
+        message_piece: MessagePiece = message.message_pieces[0]
+        last_piece = message.message_pieces[-1]
+        json_config = self._get_json_response_config(message_piece=last_piece)
 
-        async def _send_prompt_and_find_tool_call_async(
-            message: Message,
-        ) -> Optional[dict[str, Any]]:
-            """Send the prompt and return the last pending tool call, if any."""
-            assistant_reply = await send_prompt_async(message=message)
-            conversation.append(assistant_reply)
-            return self._find_last_pending_tool_call(assistant_reply)
+        working_conversation: MutableSequence[Message] = list(normalized_conversation)
 
-        tool_call_section = await _send_prompt_and_find_tool_call_async(message=message)
-        while tool_call_section:
-            # Execute the tool/function
-            tool_output = await self._execute_call_section(tool_call_section)
+        # Track all responses generated during this interaction
+        responses_to_return: list[Message] = []
 
-            # Add the tool result as a tool message to the conversation
-            # NOTE: Responses API expects a top-level {type:function_call_output, call_id, output}
-            # Use the first piece from the original message as reference for conversation context
-            reference_piece = message.message_pieces[0]
-            tool_message = self._make_tool_message(
-                tool_output, tool_call_section["call_id"], reference_piece=reference_piece
+        # Main agentic loop - each back-and-forth creates a new message
+        tool_call_section: dict[str, Any] | None = None
+
+        while True:
+            logger.info(f"Sending conversation with {len(working_conversation)} messages to the prompt target")
+
+            body = await self._construct_request_body_async(conversation=working_conversation, json_config=json_config)
+
+            # Use unified error handling - automatically detects Response and validates
+            result = await self._handle_openai_request_async(
+                api_call=lambda body=body: self._client.responses.create(**body),
+                request=message,
             )
-            conversation.append(tool_message)
 
-            # Re-ask with combined history (user + function_call + function_call_output)
-            merged: List[MessagePiece] = []
-            for msg in conversation:
-                merged.extend(msg.message_pieces)
+            # Add result to conversation and responses list
+            working_conversation.append(result)
+            responses_to_return.append(result)
 
-            # TODO: There is likely a bug here; there are different roles in a single response??
-            message = Message(message_pieces=merged, skip_validation=True)
+            # Extract tool call if present
+            tool_call_section = self._find_last_pending_tool_call(result)
 
-            # Send again and check for another tool call
-            tool_call_section = await _send_prompt_and_find_tool_call_async(message=message)
+            # If no tool call, we're done
+            if not tool_call_section:
+                break
 
-        # No other tool call found, so assistant message is complete and return last assistant reply!
-        return conversation[-1]
+            # Execute the tool/function
+            tool_output = await self._execute_call_section_async(tool_call_section)
+
+            # Create a new message with the tool output
+            tool_piece = self._make_tool_piece(tool_output, tool_call_section["call_id"], reference_piece=message_piece)
+            tool_message = Message(message_pieces=[tool_piece])
+
+            # Add tool output message to conversation and responses list
+            working_conversation.append(tool_message)
+            responses_to_return.append(tool_message)
+
+            # Continue loop to send tool result and get next response
+
+        # Return all responses (normalizer will persist all of them to memory)
+        return responses_to_return
 
     def _parse_response_output_section(
-        self, *, section: dict, message_piece: MessagePiece, error: Optional[PromptResponseError]
+        self, *, section: Any, message_piece: MessagePiece, error: PromptResponseError | None
     ) -> MessagePiece | None:
         """
         Parse model output sections, forwarding tool-calls for the agentic loop.
 
         Args:
-            section: The section dict from OpenAI output.
+            section: The section object from OpenAI SDK (Pydantic model).
             message_piece: The original message piece.
             error: Any error information from OpenAI.
 
         Returns:
             A MessagePiece for this section, or None to skip.
+
+        Raises:
+            EmptyResponseException: If the section content is empty or invalid.
+            ValueError: If the section type is unsupported.
         """
-        section_type = section.get("type", "")
+        section_type = section.type
         piece_type: PromptDataType = "text"  # Default, always set!
         piece_value = ""
 
         if section_type == MessagePieceType.MESSAGE:
-            section_content = section.get("content", [])
+            section_content = section.content
             if len(section_content) == 0:
                 raise EmptyResponseException(message="The chat returned an empty message section.")
-            piece_value = section_content[0].get("text", "")
+            piece_value = section_content[0].text
 
         elif section_type == MessagePieceType.REASONING:
-            # Keep the full reasoning JSON as a piece (internal use / debugging)
-            piece_value = json.dumps(section, separators=(",", ":"))
+            # Store reasoning in memory for debugging/logging, but won't be sent back to API
+            piece_value = json.dumps(
+                section.model_dump(),
+                separators=(",", ":"),
+            )
             piece_type = "reasoning"
 
         elif section_type == MessagePieceType.FUNCTION_CALL:
-            # Forward the tool call verbatim so the agentic loop can execute it
-            piece_value = json.dumps(section, separators=(",", ":"))
+            # Only store fields the API expects for function_call (exclude status, etc.)
+            piece_value = json.dumps(
+                {
+                    "type": "function_call",
+                    "call_id": section.call_id,
+                    "name": section.name,
+                    "arguments": section.arguments,
+                },
+                separators=(",", ":"),
+            )
             piece_type = "function_call"
 
         elif section_type == MessagePieceType.WEB_SEARCH_CALL:
-            # Forward web_search_call verbatim as a tool_call
-            piece_value = json.dumps(section, separators=(",", ":"))
+            # Forward web_search_call with only API-expected fields
+            # Note: web search may have different field structure than function calls
+            web_search_data = {
+                "type": "web_search_call",
+            }
+            # Add optional fields if they exist
+            if hasattr(section, "call_id") and section.call_id:
+                web_search_data["call_id"] = section.call_id
+            if hasattr(section, "query") and section.query:
+                web_search_data["query"] = section.query
+            if hasattr(section, "id") and section.id:
+                web_search_data["id"] = section.id
+
+            piece_value = json.dumps(web_search_data, separators=(",", ":"))
             piece_type = "tool_call"
 
         elif section_type == "custom_tool_call":
@@ -460,13 +698,13 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
             # See
             # https://platform.openai.com/docs/guides/function-calling#context-free-grammars
             logger.debug("Detected custom_tool_call in response, assuming grammar constraint.")
-            extracted_grammar_name = section.get("name")
+            extracted_grammar_name = section.name
             if extracted_grammar_name != self._grammar_name:
                 msg = "Mismatched grammar name in custom_tool_call "
                 msg += f"(expected {self._grammar_name}, got {extracted_grammar_name})"
                 logger.error(msg)
                 raise ValueError(msg)
-            piece_value = section.get("input", "")
+            piece_value = section.input
             if len(piece_value) == 0:
                 raise EmptyResponseException(message="The chat returned an empty message section.")
 
@@ -482,56 +720,52 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
             role="assistant",
             original_value=piece_value,
             conversation_id=message_piece.conversation_id,
-            labels=message_piece.labels,
-            prompt_target_identifier=message_piece.prompt_target_identifier,
-            attack_identifier=message_piece.attack_identifier,
+            labels=message_piece.labels,  # deprecated
             original_value_data_type=piece_type,
             response_error=error or "none",
         )
 
-    def _validate_request(self, *, message: Message) -> None:
-        """Validates the structure and content of a message for compatibility of this target.
-
-        Args:
-            message (Message): The message object.
-
-        Raises:
-            ValueError: If any of the message pieces have a data type other than supported set.
-        """
-        # Some models may not support all of these; we accept them at the transport layer
-        # so the Responses API can decide. We include reasoning and function_call_output now.
-        allowed_types = {"text", "image_path", "function_call", "tool_call", "function_call_output", "reasoning"}
-        for message_piece in message.message_pieces:
-            if message_piece.converted_value_data_type not in allowed_types:
-                raise ValueError(f"Unsupported data type: {message_piece.converted_value_data_type}")
-        return
-
     # Agentic helpers (module scope)
 
-    def _find_last_pending_tool_call(self, reply: Message) -> Optional[dict[str, Any]]:
+    def _find_last_pending_tool_call(self, reply: Message) -> dict[str, Any] | None:
         """
         Return the last tool-call section in assistant messages, or None.
         Looks for a piece whose value parses as JSON with a 'type' key matching function_call.
+
+        Args:
+            reply: The message to search for tool calls.
+
+        Returns:
+            The tool-call section dict, or None if not found.
         """
         for piece in reversed(reply.message_pieces):
-            if piece.role == "assistant":
+            # Filter on data_type to skip reasoning/message pieces that also have api_role "assistant".
+            if piece.api_role == "assistant" and piece.original_value_data_type == "function_call":
                 try:
                     section = json.loads(piece.original_value)
                 except Exception:
                     continue
-                if section.get("type") == "function_call":
+                if isinstance(section, dict) and section.get("type") == "function_call":
                     # Do NOT skip function_call even if status == "completed" — we still need to emit the output.
-                    return section
+                    return cast("dict[str, Any]", section)
         return None
 
-    async def _execute_call_section(self, tool_call_section: dict[str, Any]) -> dict[str, Any]:
+    async def _execute_call_section_async(self, tool_call_section: dict[str, Any]) -> dict[str, Any]:
         """
         Execute a function_call from the custom_functions registry.
+
+        Args:
+            tool_call_section: The function_call section dict.
 
         Returns:
             A dict payload (will be serialized and sent as function_call_output).
             If fail_on_missing_function=False and a function is missing or no function is not called, returns:
             {"error": "function_not_found", "missing_function": "<name>", "available_functions": [...]}
+
+        Raises:
+            ValueError: If the function call section is missing a 'name' field.
+            ValueError: If the function arguments are malformed.
+            KeyError: If the function name is not registered in custom_functions.
         """
         name = tool_call_section.get("name")
         if not name:
@@ -548,7 +782,7 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
         except Exception:
             # If arguments are not valid JSON, surface a structured error (or raise)
             if self._fail_on_missing_function:
-                raise ValueError(f"Malformed arguments for function '{name}': {args_json}")
+                raise ValueError(f"Malformed arguments for function '{name}': {args_json}") from None
             logger.warning("Malformed arguments for function '%s': %s", name, args_json)
             return {
                 "error": "malformed_arguments",
@@ -571,9 +805,9 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
 
         return await fn(args)
 
-    def _make_tool_message(self, output: dict[str, Any], call_id: str, *, reference_piece: MessagePiece) -> Message:
+    def _make_tool_piece(self, output: dict[str, Any], call_id: str, *, reference_piece: MessagePiece) -> MessagePiece:
         """
-        Wrap tool output as a top-level function_call_output artifact.
+        Create a function_call_output MessagePiece.
 
         Args:
             output: The tool output to wrap.
@@ -581,20 +815,16 @@ class OpenAIResponseTarget(OpenAIChatTargetBase):
             reference_piece: A reference piece to copy conversation context from.
 
         Returns:
-            A Message containing the function call output.
+            A MessagePiece containing the function call output.
         """
         output_str = output if isinstance(output, str) else json.dumps(output, separators=(",", ":"))
-        piece = MessagePiece(
-            role="assistant",
+        return MessagePiece(
+            role="tool",
             original_value=json.dumps(
                 {"type": "function_call_output", "call_id": call_id, "output": output_str},
                 separators=(",", ":"),
             ),
             original_value_data_type="function_call_output",
             conversation_id=reference_piece.conversation_id,
-            labels={"call_id": call_id},
-            prompt_target_identifier=reference_piece.prompt_target_identifier,
-            attack_identifier=reference_piece.attack_identifier,
+            labels={"call_id": call_id},  # deprecated
         )
-
-        return Message(message_pieces=[piece])

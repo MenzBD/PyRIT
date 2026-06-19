@@ -5,16 +5,25 @@ import csv
 import json
 import sys
 from pathlib import Path
-from typing import IO
+from typing import IO, Any, cast
 
-from pyrit.models import Message, MessagePiece
-from pyrit.prompt_target import PromptTarget
+from pyrit.common.deprecation import print_deprecation_message
+from pyrit.models import (
+    ChatMessageRole,
+    Conversation,
+    Message,
+    MessagePiece,
+    PromptDataType,
+    PromptResponseError,
+)
+from pyrit.prompt_target.common.prompt_target import PromptTarget
+from pyrit.prompt_target.common.target_configuration import TargetConfiguration
 
 
 class TextTarget(PromptTarget):
     """
     The TextTarget takes prompts, adds them to memory and writes them to io
-    which is sys.stdout by default
+    which is sys.stdout by default.
 
     This can be useful in various situations, for example, if operators want to generate prompts
     but enter them manually.
@@ -24,50 +33,107 @@ class TextTarget(PromptTarget):
         self,
         *,
         text_stream: IO[str] = sys.stdout,
+        custom_configuration: TargetConfiguration | None = None,
     ) -> None:
-        super().__init__()
+        """
+        Initialize the TextTarget.
+
+        Args:
+            text_stream (IO[str]): The text stream to write prompts to. Defaults to sys.stdout.
+            custom_configuration (TargetConfiguration, Optional): Override the default configuration for
+                this target instance. Defaults to None.
+        """
+        super().__init__(custom_configuration=custom_configuration)
         self._text_stream = text_stream
 
-    async def send_prompt_async(self, *, message: Message) -> Message:
+    async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
+        """
+        Asynchronously write a message to the text stream.
 
-        self._validate_request(message=message)
+        Args:
+            normalized_conversation (list[Message]): The full conversation
+                (history + current message) after running the normalization
+                pipeline. The current message is the last element.
+
+        Returns:
+            list[Message]: An empty list (no response expected).
+        """
+        message = normalized_conversation[-1]
 
         self._text_stream.write(f"{str(message)}\n")
         self._text_stream.flush()
 
-        return None
+        return []
 
     def import_scores_from_csv(self, csv_file_path: Path) -> list[MessagePiece]:
+        """
+        Import message pieces and their scores from a CSV file.
+
+        Args:
+            csv_file_path (Path): The path to the CSV file containing scores.
+
+        Returns:
+            list[MessagePiece]: A list of message pieces imported from the CSV.
+
+        Raises:
+            ValueError: If a row is missing a ``conversation_id``.
+        """
+        print_deprecation_message(
+            old_item="pyrit.prompt_target.TextTarget.import_scores_from_csv",
+            new_item="pyrit.memory.MemoryInterface.add_message_pieces_to_memory",
+            removed_in="0.16.0",
+        )
 
         message_pieces = []
 
         with open(csv_file_path, newline="") as csvfile:
             csvreader = csv.DictReader(csvfile)
 
-            for row in csvreader:
-                sequence_str = row.get("sequence", None)
-                labels_str = row.get("labels", None)
-                labels = json.loads(labels_str) if labels_str else None
+            for row_number, row in enumerate(csvreader, start=1):
+                sequence_str = row.get("sequence")
+                labels_str = row.get("labels")
 
-                message_piece = MessagePiece(
-                    role=row["role"],  # type: ignore
-                    original_value=row["value"],
-                    original_value_data_type=row.get["data_type", None],  # type: ignore
-                    conversation_id=row.get("conversation_id", None),
-                    sequence=int(sequence_str) if sequence_str else None,
-                    labels=labels,
-                    response_error=row.get("response_error", None),  # type: ignore
-                    prompt_target_identifier=self.get_identifier(),
-                )
-                message_pieces.append(message_piece)
+                conversation_id = row.get("conversation_id")
+                if not conversation_id or not conversation_id.strip():
+                    raise ValueError(
+                        f"Row {row_number} of '{csv_file_path}' is missing a 'conversation_id'. "
+                        "Every imported row must specify the conversation it belongs to."
+                    )
+
+                piece_kwargs: dict[str, Any] = {
+                    "role": cast("ChatMessageRole", row["role"]),
+                    "original_value": row["value"],
+                    "sequence": int(sequence_str) if sequence_str else 0,
+                    "conversation_id": conversation_id,
+                }
+                if row.get("data_type"):
+                    piece_kwargs["original_value_data_type"] = cast("PromptDataType", row["data_type"])
+                if labels_str:
+                    piece_kwargs["labels"] = json.loads(labels_str)  # deprecated
+                if row.get("response_error"):
+                    piece_kwargs["response_error"] = cast("PromptResponseError", row["response_error"])
+
+                message_pieces.append(MessagePiece(**piece_kwargs))
 
         # This is post validation, so the message_pieces should be okay and normalized
+        for conversation_id in {piece.conversation_id for piece in message_pieces if piece.conversation_id}:
+            self._memory.add_conversation_to_memory(
+                conversation=Conversation(conversation_id=conversation_id, target_identifier=self.get_identifier())
+            )
         self._memory.add_message_pieces_to_memory(message_pieces=message_pieces)
         return message_pieces
 
-    def _validate_request(self, *, message: Message) -> None:
+    def _validate_request(self, *, normalized_conversation: list[Message]) -> None:
         pass
 
-    async def cleanup_target(self):
+    async def cleanup_target_async(self) -> None:
         """Target does not require cleanup."""
-        pass
+
+    async def cleanup_target(self) -> None:  # pyrit-async-suffix-exempt
+        """Use ``cleanup_target_async`` instead; this is a deprecated alias."""
+        print_deprecation_message(
+            old_item="pyrit.prompt_target.TextTarget.cleanup_target",
+            new_item="pyrit.prompt_target.TextTarget.cleanup_target_async",
+            removed_in="0.16.0",
+        )
+        await self.cleanup_target_async()

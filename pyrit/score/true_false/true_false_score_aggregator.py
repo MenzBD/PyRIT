@@ -3,21 +3,22 @@
 
 import functools
 import operator
-from typing import Callable, Iterable, List
+from collections.abc import Callable, Iterable
 
 from pyrit.models import Score
-from pyrit.score.aggregator_utils import (
+from pyrit.score.score_aggregator_result import ScoreAggregatorResult
+from pyrit.score.score_utils import (
     combine_metadata_and_categories,
     format_score_for_rationale,
 )
-from pyrit.score.score_aggregator_result import ScoreAggregatorResult
 
 BinaryBoolOp = Callable[[bool, bool], bool]
 TrueFalseAggregatorFunc = Callable[[Iterable[Score]], ScoreAggregatorResult]
 
 
-def _build_rationale(scores: List[Score], *, result: bool, true_msg: str, false_msg: str) -> tuple[str, str]:
-    """Build description and rationale for aggregated true/false scores.
+def _build_rationale(scores: list[Score], *, result: bool, true_msg: str, false_msg: str) -> tuple[str, str]:
+    """
+    Build description and rationale for aggregated true/false scores.
 
     Args:
         scores: List of Score objects to aggregate.
@@ -41,15 +42,16 @@ def _build_rationale(scores: List[Score], *, result: bool, true_msg: str, false_
 def _create_aggregator(
     name: str,
     *,
-    result_func: Callable[[List[bool]], bool],
+    result_func: Callable[[list[bool]], bool],
     true_msg: str,
     false_msg: str,
 ) -> TrueFalseAggregatorFunc:
-    """Create a True/False aggregator using a result function over boolean values.
+    """
+    Create a True/False aggregator using a result function over boolean values.
 
     Args:
         name (str): Name of the aggregator variant.
-        result_func (Callable[[List[bool]], bool]): Function applied to the list of boolean values
+        result_func (Callable[[list[bool]], bool]): Function applied to the list of boolean values
             to compute the aggregation result.
         true_msg (str): Description to use when the result is True.
         false_msg (str): Description to use when the result is False.
@@ -100,7 +102,8 @@ def _create_binary_aggregator(
     true_msg: str,
     false_msg: str,
 ) -> TrueFalseAggregatorFunc:
-    """Turn a binary Boolean operator (e.g. operator.and_) into an aggregation function.
+    """
+    Turn a binary Boolean operator (e.g. operator.and_) into an aggregation function.
 
     Args:
         name (str): Name of the aggregator variant.
@@ -113,7 +116,7 @@ def _create_binary_aggregator(
     """
     return _create_aggregator(
         name,
-        result_func=lambda bs, _op=op: functools.reduce(_op, bs),  # type: ignore[misc]
+        result_func=lambda bs, _op=op: functools.reduce(_op, bs),
         true_msg=true_msg,
         false_msg=false_msg,
     )
@@ -121,7 +124,8 @@ def _create_binary_aggregator(
 
 # True/False aggregators (return list with single score)
 class TrueFalseScoreAggregator:
-    """Namespace for true/false score aggregators that return a single aggregated score.
+    """
+    Namespace for true/false score aggregators that return a single aggregated score.
 
     All aggregators return a list containing one ScoreAggregatorResult that combines
     all input scores together, preserving all categories.

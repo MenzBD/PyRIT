@@ -1,16 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+import asyncio
+import contextlib
 import logging
-import os
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
 from pyrit.common.path import DB_DATA_PATH
-from pyrit.models import PromptDataType, data_serializer_factory
-from pyrit.prompt_converter import ConverterResult, PromptConverter
+from pyrit.memory import data_serializer_factory
+from pyrit.models import ComponentIdentifier, PromptDataType
+from pyrit.prompt_converter.prompt_converter import ConverterResult, PromptConverter
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +32,23 @@ class AddImageVideoConverter(PromptConverter):
     Currently the image is placed in the whole video, not at a specific timepoint.
     """
 
+    SUPPORTED_INPUT_TYPES = ("image_path",)
+    SUPPORTED_OUTPUT_TYPES = ("video_path",)
+
+    # Grandfathered: ``video_path`` is part of the public positional API.
+    # TODO: remove this opt-out and insert ``*,`` after ``self`` in 0.16.0
+    # (this will be a BREAKING CHANGE for callers passing arguments positionally).
+    _brick_legacy_init = True
+
     def __init__(
         self,
         video_path: str,
-        output_path: Optional[str] = None,
-        img_position: tuple = (10, 10),
-        img_resize_size: tuple = (500, 500),
-    ):
+        output_path: str | None = None,
+        img_position: tuple[int, int] = (10, 10),
+        img_resize_size: tuple[int, int] = (500, 500),
+    ) -> None:
         """
-        Initializes the converter with the video path and image properties.
+        Initialize the converter with the video path and image properties.
 
         Args:
             video_path (str): File path of video to add image to.
@@ -50,7 +59,6 @@ class AddImageVideoConverter(PromptConverter):
         Raises:
             ValueError: If ``video_path`` is empty or invalid.
         """
-
         if not video_path:
             raise ValueError("Please provide valid video path")
 
@@ -59,9 +67,24 @@ class AddImageVideoConverter(PromptConverter):
         self._img_resize_size = img_resize_size
         self._video_path = video_path
 
-    async def _add_image_to_video(self, image_path: str, output_path: str) -> str:
+    def _build_identifier(self) -> ComponentIdentifier:
         """
-        Adds an image to video.
+        Build identifier with video converter parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this converter.
+        """
+        return self._create_identifier(
+            params={
+                "video_path": str(self._video_path),
+                "img_position": self._img_position,
+                "img_resize_size": self._img_resize_size,
+            }
+        )
+
+    async def _add_image_to_video_async(self, image_path: str, output_path: str) -> str:
+        """
+        Add an image to video.
 
         Args:
             image_path (str): The image path to add to video.
@@ -69,8 +92,11 @@ class AddImageVideoConverter(PromptConverter):
 
         Returns:
             str: The output video path.
-        """
 
+        Raises:
+            ModuleNotFoundError: If OpenCV is not installed.
+            ValueError: If the image path is invalid or unsupported video format.
+        """
         try:
             import cv2  # noqa: F401
         except ModuleNotFoundError as e:
@@ -88,10 +114,46 @@ class AddImageVideoConverter(PromptConverter):
         )
 
         # Open the video to ensure it exists
-        video_bytes = await input_video_data.read_data()
+        video_bytes = await input_video_data.read_data_async()
+        input_image_bytes = await input_image_data.read_data_async()
 
         azure_storage_flag = input_video_data._is_azure_storage_url(self._video_path)
+
+        await asyncio.to_thread(
+            self._add_image_to_video_sync,
+            video_bytes=video_bytes,
+            image_bytes=input_image_bytes,
+            output_path=output_path,
+            azure_storage_flag=azure_storage_flag,
+        )
+
+        logger.info(f"Video saved as {output_path}")
+
+        return output_path
+
+    def _add_image_to_video_sync(
+        self,
+        *,
+        video_bytes: bytes,
+        image_bytes: bytes,
+        output_path: str,
+        azure_storage_flag: bool,
+    ) -> None:
+        """
+        Run the blocking cv2 pipeline and temp-file I/O on a worker thread.
+
+        Designed to be invoked via ``asyncio.to_thread`` so the event loop is not blocked.
+
+        Raises:
+            ValueError: If the input video format is unsupported or the overlay image cannot
+                be decoded.
+        """
+        import cv2
+
         video_path = self._video_path
+        local_temp_path: Path | None = None
+        cap: cv2.VideoCapture | None = None
+        output_video: cv2.VideoWriter | None = None
 
         try:
             if azure_storage_flag:
@@ -111,17 +173,18 @@ class AddImageVideoConverter(PromptConverter):
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             file_extension = video_path.split(".")[-1].lower()
             if file_extension in video_encoding_map:
-                video_char_code = cv2.VideoWriter_fourcc(*video_encoding_map[file_extension])  # type: ignore
+                video_char_code = cv2.VideoWriter.fourcc(*video_encoding_map[file_extension])
                 output_video = cv2.VideoWriter(output_path, video_char_code, fps, (width, height))
             else:
                 raise ValueError(f"Unsupported video format: {file_extension}")
 
             # Load and resize the overlay image
 
-            input_image_bytes = await input_image_data.read_data()
-            image_np_arr = np.frombuffer(input_image_bytes, np.uint8)
-            overlay = cv2.imdecode(image_np_arr, cv2.IMREAD_UNCHANGED)
-            overlay = cv2.resize(overlay, self._img_resize_size)
+            image_np_arr = np.frombuffer(image_bytes, np.uint8)
+            decoded = cv2.imdecode(image_np_arr, cv2.IMREAD_UNCHANGED)
+            if decoded is None:
+                raise ValueError("Failed to decode overlay image")
+            overlay = cv2.resize(decoded, self._img_resize_size)
 
             # Get overlay image dimensions
             image_height, image_width, _ = overlay.shape
@@ -141,7 +204,7 @@ class AddImageVideoConverter(PromptConverter):
                 # Blend overlay with frame
                 if overlay.shape[2] == 4:  # Check number of channels on image
                     alpha_overlay = overlay[:, :, 3] / 255.0
-                    for c in range(0, 3):
+                    for c in range(3):
                         frame[y : y + image_height, x : x + image_width, c] = (
                             alpha_overlay * overlay[:, :, c]
                             + (1 - alpha_overlay) * frame[y : y + image_height, x : x + image_width, c]
@@ -153,20 +216,19 @@ class AddImageVideoConverter(PromptConverter):
                 output_video.write(frame)
 
         finally:
-            # Release everything
-            cap.release()
-            output_video.release()
-            cv2.destroyAllWindows()
-            if azure_storage_flag:
-                os.remove(local_temp_path)
-
-        logger.info(f"Video saved as {output_path}")
-
-        return output_path
+            # Release everything (guarded — early raises may leave cap/output_video unbound)
+            if cap is not None:
+                cap.release()
+            if output_video is not None:
+                output_video.release()
+            with contextlib.suppress(cv2.error):
+                cv2.destroyAllWindows()  # Not available in headless OpenCV builds
+            if azure_storage_flag and local_temp_path is not None:
+                local_temp_path.unlink()
 
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "image_path") -> ConverterResult:
         """
-        Converts the given prompt (image) by adding it to a video.
+        Convert the given prompt (image) by adding it to a video.
 
         Args:
             prompt (str): The image path to be added to the video.
@@ -184,16 +246,12 @@ class AddImageVideoConverter(PromptConverter):
         output_video_serializer = data_serializer_factory(category="prompt-memory-entries", data_type="video_path")
 
         if not self._output_path:
-            output_video_serializer.value = await output_video_serializer.get_data_filename()
+            output_video_serializer.value = str(await output_video_serializer.get_data_filename_async())
         else:
             output_video_serializer.value = self._output_path
 
         # Add video to the image
-        updated_video = await self._add_image_to_video(image_path=prompt, output_path=output_video_serializer.value)
+        updated_video = await self._add_image_to_video_async(
+            image_path=prompt, output_path=output_video_serializer.value
+        )
         return ConverterResult(output_text=str(updated_video), output_type="video_path")
-
-    def input_supported(self, input_type: PromptDataType) -> bool:
-        return input_type == "image_path"
-
-    def output_supported(self, output_type: PromptDataType) -> bool:
-        return output_type == "video_path"

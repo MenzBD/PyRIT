@@ -10,10 +10,24 @@ which are class-based alternatives to initialization scripts.
 
 import sys
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from typing import Any
 
 from pyrit.common.apply_defaults import get_global_default_values
+from pyrit.common.deprecation import print_deprecation_message
+from pyrit.common.parameter import Parameter
+
+
+def __getattr__(name: str) -> type:
+    if name == "InitializerParameter":
+        print_deprecation_message(
+            old_item="pyrit.setup.initializers.pyrit_initializer.InitializerParameter",
+            new_item=Parameter,
+            removed_in="0.16.0",
+        )
+        return Parameter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class PyRITInitializer(ABC):
@@ -24,41 +38,61 @@ class PyRITInitializer(ABC):
     and global settings during PyRIT initialization. They replace the need for
     initialization scripts with type-safe, validated, and discoverable classes.
 
-    All initializers must implement the `name`, `description`, and `initialize`
-    properties/methods. The `validate` method can be overridden if custom
-    validation logic is needed.
+    Subclasses must implement `initialize_async`. Description is automatically
+    derived from the class docstring. Initializers execute in the order they
+    are provided — no explicit execution_order is needed.
     """
 
     def __init__(self) -> None:
         """Initialize the PyRIT initializer with no parameters."""
-        pass
+        self.params: dict[str, list[str]] = {}
+
+    def set_params_from_args(self, *, args: dict[str, Any]) -> None:
+        """
+        Set params from a YAML-style args dictionary.
+
+        Converts each value to a list of strings: lists are stringified element-wise,
+        scalars are wrapped in a single-element list.
+
+        Args:
+            args: Dictionary of argument names to values (scalars or lists).
+        """
+        self.params = {k: [str(i) for i in v] if isinstance(v, list) else [str(v)] for k, v in args.items()}
 
     @property
-    @abstractmethod
     def name(self) -> str:
         """
-        Get the human-readable name for this initializer.
+        Deprecated. Use the class docstring for description instead.
 
         Returns:
-            str: A clear, descriptive name for this initializer.
+            str: The class name.
         """
-        pass
+        from pyrit.common.deprecation import print_deprecation_message
+
+        print_deprecation_message(
+            old_item="PyRITInitializer.name",
+            new_item="class docstring (used automatically for description)",
+            removed_in="0.16.0",
+        )
+        return type(self).__name__
 
     @property
     def description(self) -> str:
         """
         Get a description of what this initializer configures.
 
-        Override this property to provide a custom description.
-        Defaults to returning the name of the initializer.
+        By default, extracts the description from the class docstring.
+        Falls back to the class name if no docstring is available.
 
         Returns:
             str: A description of the configuration changes this initializer makes.
         """
-        return self.name
+        from pyrit.registry.base import ClassRegistryEntry
+
+        return ClassRegistryEntry.description_from_docstring(self.__class__, fallback=type(self).__name__)
 
     @property
-    def required_env_vars(self) -> List[str]:
+    def required_env_vars(self) -> list[str]:
         """
         Get list of required environment variables for this initializer.
 
@@ -66,72 +100,118 @@ class PyRITInitializer(ABC):
         set for this initializer to work correctly.
 
         Returns:
-            List[str]: List of required environment variable names. Defaults to empty list.
+            list[str]: List of required environment variable names. Defaults to empty list.
         """
         return []
 
     @property
     def execution_order(self) -> int:
         """
-        Get the execution order for this initializer.
-
-        Initializers are executed in ascending order (lower numbers first).
-        This allows control over dependency ordering - for example, basic
-        configuration can run before more specialized setup.
+        Deprecated. Initializers now execute in the order they are listed.
 
         Returns:
-            int: The execution order. Defaults to 1. Lower numbers execute first.
-
-        Example:
-            - execution_order = 0: Very early setup (environment, logging)
-            - execution_order = 1: Standard configuration (default)
-            - execution_order = 2: Advanced/specialized setup
-            - execution_order = 10: Final cleanup or overrides
+            int: Always returns 1.
         """
+        from pyrit.common.deprecation import print_deprecation_message
+
+        print_deprecation_message(
+            old_item="PyRITInitializer.execution_order",
+            new_item="list ordering in configuration (initializers execute in listed order)",
+            removed_in="0.16.0",
+        )
         return 1
 
-    @abstractmethod
-    def initialize(self) -> None:
+    @property
+    def supported_parameters(self) -> list[Parameter]:
         """
-        Execute the initialization logic.
+        Get the list of parameters this initializer accepts.
+
+        Override this property to declare what parameters the initializer
+        supports. Parameters are set on self.params before initialize_async() is called.
+
+        Note: ``Scenario.supported_parameters`` is a classmethod (so ``--list-scenarios``
+        can introspect without instantiating). Aligning these is a future improvement.
+
+        Returns:
+            list[Parameter]: List of supported parameters. Defaults to empty list.
+        """
+        return []
+
+    @abstractmethod
+    async def initialize_async(self) -> None:
+        """
+        Execute the initialization logic asynchronously.
 
         This method should contain all the configuration logic, including
         calls to set_default_value() and set_global_variable() as needed.
+        All initializers must implement this as an async method.
+
+        Subclasses that accept parameters should read them from self.params,
+        which is populated before this method is called.
         """
-        pass
 
     def validate(self) -> None:
         """
         Validate the initializer configuration before execution.
 
-        This method checks that all required environment variables are set.
+        This method checks that all required environment variables are set
+        and validates any configured parameters against supported_parameters.
         Subclasses should not override this method.
 
         Raises:
-            ValueError: If required environment variables are not set.
+            ValueError: If required environment variables are not set or
+                if configured parameters are invalid.
         """
         import os
 
         missing_vars = [var for var in self.required_env_vars if not os.getenv(var)]
         if missing_vars:
             raise ValueError(
-                f"Initializer '{self.name}' requires the following environment variables to be set: "
+                f"Initializer '{type(self).__name__}' requires the following environment variables to be set: "
                 f"{', '.join(missing_vars)}"
             )
 
-    def initialize_with_tracking(self) -> None:
+        # Validate configured params
+        if self.params:
+            self._validate_params(params=self.params)
+
+    def _validate_params(self, *, params: dict[str, list[str]]) -> None:
+        """
+        Validate parameters against supported_parameters.
+
+        Checks that all provided params are declared in supported_parameters
+        and that all required params are present.
+
+        Args:
+            params: The parameters to validate.
+
+        Raises:
+            ValueError: If unknown parameters are provided or required parameters are missing.
+        """
+        supported = {p.name: p for p in self.supported_parameters}
+        supported_names = set(supported.keys())
+
+        # Check for unknown params
+        unknown = set(params.keys()) - supported_names
+        if unknown:
+            raise ValueError(
+                f"Initializer '{type(self).__name__}' received unknown parameter(s): {', '.join(sorted(unknown))}. "
+                f"Supported parameters: {', '.join(sorted(supported_names)) if supported_names else 'none'}"
+            )
+
+    async def initialize_with_tracking_async(self) -> None:
         """
         Execute initialization while tracking what changes are made.
 
-        This method runs initialize() and captures information about what
+        This method runs initialize_async() and captures information about what
         default values and global variables were set. The tracking information
         is not cached - it's captured during the actual initialization run.
         """
         with self._track_initialization_changes():
-            self.initialize()
+            await self.initialize_async()
 
     @contextmanager
-    def _track_initialization_changes(self) -> Iterator[Dict[str, Any]]:
+    def _track_initialization_changes(self) -> Iterator[dict[str, Any]]:
         """
         Context manager to track what changes during initialization.
 
@@ -144,7 +224,7 @@ class PyRITInitializer(ABC):
         current_main_dict = dict(sys.modules["__main__"].__dict__)
 
         # Initialize tracking dict
-        tracking_info: Dict[str, List[str]] = {"default_values": [], "global_variables": []}
+        tracking_info: dict[str, list[str]] = {"default_values": [], "global_variables": []}
 
         try:
             yield tracking_info
@@ -154,18 +234,18 @@ class PyRITInitializer(ABC):
             new_main_dict = sys.modules["__main__"].__dict__
 
             # Track default values that were added - just collect class.parameter pairs
-            for scope, value in new_defaults.items():
+            for scope in new_defaults:
                 if scope not in current_default_keys:
                     class_param = f"{scope.class_type.__name__}.{scope.parameter_name}"
                     if class_param not in tracking_info["default_values"]:
                         tracking_info["default_values"].append(class_param)
 
             # Track global variables that were added - just collect the variable names
-            for name in new_main_dict.keys():
+            for name in new_main_dict:
                 if name not in current_main_dict and name not in tracking_info["global_variables"]:
                     tracking_info["global_variables"].append(name)
 
-    def get_dynamic_default_values_info(self) -> Dict[str, Any]:
+    async def get_dynamic_default_values_info_async(self) -> dict[str, Any]:
         """
         Get information about what default values and global variables this initializer sets.
         This is useful for debugging what default_values are set by an initializer.
@@ -175,7 +255,7 @@ class PyRITInitializer(ABC):
         initializer has been run before or which instance is queried.
 
         Returns:
-            Dict[str, Any]: Information about what defaults and globals are set.
+            dict[str, Any]: Information about what defaults and globals are set.
         """
         # Check if memory is initialized - required for running initialization in sandbox
         from pyrit.memory import CentralMemory
@@ -185,8 +265,8 @@ class PyRITInitializer(ABC):
         except ValueError:
             # Memory is not initialized - return helpful message
             return {
-                "default_values": "Call initialize_pyrit() first to see what this initializer configures",
-                "global_variables": "Call initialize_pyrit() first to see what this initializer configures",
+                "default_values": "Call await initialize_pyrit_async() first to see what this initializer configures",
+                "global_variables": "Call await initialize_pyrit_async() first to see what this initializer configures",
             }
 
         # Capture current state for restoration (before try block so finally can access)
@@ -209,10 +289,9 @@ class PyRITInitializer(ABC):
                 del sys.modules["__main__"].__dict__[var_name]
 
         try:
-
             # Run initialization in sandbox with tracking (starting from empty state)
             with self._track_initialization_changes() as tracking_info:
-                self.initialize()
+                await self.initialize_async()
 
             return tracking_info
 
@@ -231,12 +310,13 @@ class PyRITInitializer(ABC):
 
             current_main_keys = set(sys.modules["__main__"].__dict__.keys())
             for var_name in list(current_main_keys):
-                if var_name in temp_backup_globals or var_name in original_main_keys:
-                    if var_name in sys.modules["__main__"].__dict__ and not var_name.startswith("_"):
-                        try:
-                            del sys.modules["__main__"].__dict__[var_name]
-                        except KeyError:
-                            pass
+                if (
+                    (var_name in temp_backup_globals or var_name in original_main_keys)
+                    and var_name in sys.modules["__main__"].__dict__
+                    and not var_name.startswith("_")
+                ):
+                    with suppress(KeyError):
+                        del sys.modules["__main__"].__dict__[var_name]
 
             # Then restore what was there originally
             for scope_key, value in temp_backup_defaults.items():
@@ -246,33 +326,42 @@ class PyRITInitializer(ABC):
                 sys.modules["__main__"].__dict__[var_name] = value
 
     @classmethod
-    def get_info(cls) -> Dict[str, Any]:
+    async def get_info_async(cls) -> dict[str, Any]:
         """
         Get information about this initializer class.
 
         This is a class method so it can be called without instantiating the class:
-        SimpleInitializer.get_info() instead of SimpleInitializer().get_info()
+        await SimpleInitializer.get_info_async() instead of SimpleInitializer().get_info_async()
 
         Returns:
-            Dict[str, Any]: Dictionary containing name, description, class information, and default values.
+            dict[str, Any]: Dictionary containing name, description, class information, and default values.
         """
         # Create a temporary instance to access properties
         instance = cls()
 
         base_info = {
-            "name": instance.name,
             "description": instance.description,
             "class": cls.__name__,
-            "execution_order": instance.execution_order,
         }
+
+        # Add supported parameters if any are declared
+        if instance.supported_parameters:
+            base_info["supported_parameters"] = [  # type: ignore[ty:invalid-assignment]
+                {
+                    "name": p.name,
+                    "description": p.description,
+                    "default": p.default,
+                }
+                for p in instance.supported_parameters
+            ]
 
         # Add required environment variables if any are defined
         if instance.required_env_vars:
-            base_info["required_env_vars"] = instance.required_env_vars
+            base_info["required_env_vars"] = instance.required_env_vars  # type: ignore[ty:invalid-assignment]
 
         # Add dynamic default values information
         try:
-            defaults_info = instance.get_dynamic_default_values_info()
+            defaults_info = await instance.get_dynamic_default_values_info_async()
             base_info["default_values"] = defaults_info["default_values"]
             base_info["global_variables"] = defaults_info["global_variables"]
         except Exception as e:

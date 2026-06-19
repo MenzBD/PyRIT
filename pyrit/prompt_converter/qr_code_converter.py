@@ -1,31 +1,38 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from typing import Optional
 
 import segno
 
-from pyrit.models import PromptDataType, data_serializer_factory
-from pyrit.prompt_converter import ConverterResult, PromptConverter
+from pyrit.memory import data_serializer_factory
+from pyrit.models import ComponentIdentifier, PromptDataType
+from pyrit.prompt_converter.prompt_converter import ConverterResult, PromptConverter
 
 
 class QRCodeConverter(PromptConverter):
     """Converts a text string to a QR code image."""
 
+    SUPPORTED_INPUT_TYPES = ("text",)
+    SUPPORTED_OUTPUT_TYPES = ("image_path",)
+
+    # Grandfathered: all parameters are part of the public positional API.
+    # TODO: remove this opt-out and insert ``*,`` after ``self`` in 0.16.0.
+    _brick_legacy_init = True
+
     def __init__(
         self,
         scale: int = 3,
         border: int = 4,
-        dark_color: tuple = (0, 0, 0),
-        light_color: tuple = (255, 255, 255),
-        data_dark_color: Optional[tuple] = None,
-        data_light_color: Optional[tuple] = None,
-        finder_dark_color: Optional[tuple] = None,
-        finder_light_color: Optional[tuple] = None,
-        border_color: Optional[tuple] = None,
-    ):
+        dark_color: tuple[int, int, int] = (0, 0, 0),
+        light_color: tuple[int, int, int] = (255, 255, 255),
+        data_dark_color: tuple[int, int, int] | None = None,
+        data_light_color: tuple[int, int, int] | None = None,
+        finder_dark_color: tuple[int, int, int] | None = None,
+        finder_light_color: tuple[int, int, int] | None = None,
+        border_color: tuple[int, int, int] | None = None,
+    ) -> None:
         """
-        Initializes the converter with specified parameters for QR code generation.
+        Initialize the converter with specified parameters for QR code generation.
 
         Args:
             scale (int, Optional): Scaling factor that determines the width/height in pixels of each
@@ -57,9 +64,25 @@ class QRCodeConverter(PromptConverter):
         self._border_color = border_color or light_color
         self._img_serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
 
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build identifier with QR code parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this converter.
+        """
+        return self._create_identifier(
+            params={
+                "scale": self._scale,
+                "border": self._border,
+                "dark_color": self._dark_color,
+                "light_color": self._light_color,
+            }
+        )
+
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "text") -> ConverterResult:
         """
-        Converts the given prompt to a QR code image.
+        Convert the given prompt to a QR code image.
 
         Args:
             prompt (str): The prompt to be converted.
@@ -76,7 +99,7 @@ class QRCodeConverter(PromptConverter):
         if prompt.strip() == "":
             raise ValueError("Please provide valid text value")
         # Generate random unique filename
-        img_serializer_file = str(await self._img_serializer.get_data_filename())
+        img_serializer_file = str(await self._img_serializer.get_data_filename_async())
 
         # Create QRCode object
         qr = segno.make_qr(prompt)
@@ -94,9 +117,3 @@ class QRCodeConverter(PromptConverter):
             quiet_zone=self._border_color,
         )
         return ConverterResult(output_text=img_serializer_file, output_type="image_path")
-
-    def input_supported(self, input_type: PromptDataType) -> bool:
-        return input_type == "text"
-
-    def output_supported(self, output_type: PromptDataType) -> bool:
-        return output_type == "image_path"

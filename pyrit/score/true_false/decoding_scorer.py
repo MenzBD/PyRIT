@@ -1,11 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from typing import Optional
 
 from pyrit.analytics.text_matching import ExactTextMatching, TextMatching
 from pyrit.memory.central_memory import CentralMemory
-from pyrit.models import MessagePiece, Score
+from pyrit.models import ComponentIdentifier, MessagePiece, Score
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
 from pyrit.score.true_false.true_false_score_aggregator import (
     TrueFalseAggregatorFunc,
@@ -23,45 +22,61 @@ class DecodingScorer(TrueFalseScorer):
     text matching strategy.
     """
 
-    _default_validator: ScorerPromptValidator = ScorerPromptValidator(
+    _DEFAULT_VALIDATOR: ScorerPromptValidator = ScorerPromptValidator(
         supported_data_types=["text"], supported_roles=["assistant"]
     )
 
     def __init__(
         self,
         *,
-        text_matcher: Optional[TextMatching] = None,
-        categories: Optional[list[str]] = None,
+        text_matcher: TextMatching | None = None,
+        categories: list[str] | None = None,
         aggregator: TrueFalseAggregatorFunc = TrueFalseScoreAggregator.OR,
-        validator: Optional[ScorerPromptValidator] = None,
+        validator: ScorerPromptValidator | None = None,
     ) -> None:
-        """Initialize the DecodingScorer.
+        """
+        Initialize the DecodingScorer.
 
         Args:
-            text_matcher (Optional[TextMatching]): The text matching strategy to use.
+            text_matcher (TextMatching | None): The text matching strategy to use.
                 Defaults to ExactTextMatching with case_sensitive=False.
-            categories (Optional[list[str]]): Optional list of categories for the score. Defaults to None.
+            categories (list[str] | None): Optional list of categories for the score. Defaults to None.
             aggregator (TrueFalseAggregatorFunc): The aggregator function to use.
                 Defaults to TrueFalseScoreAggregator.OR.
-            validator (Optional[ScorerPromptValidator]): Custom validator. Defaults to None.
+            validator (ScorerPromptValidator | None): Custom validator. Defaults to None.
         """
-        super().__init__(score_aggregator=aggregator, validator=validator or self._default_validator)
         self._text_matcher = text_matcher if text_matcher else ExactTextMatching(case_sensitive=False)
         self._score_categories = categories if categories else []
 
-    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: Optional[str] = None) -> list[Score]:
-        """Score the given request piece based on text matching strategy.
+        super().__init__(score_aggregator=aggregator, validator=validator or self._DEFAULT_VALIDATOR)
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier for this scorer.
+
+        Returns:
+            ComponentIdentifier: The identifier for this scorer.
+        """
+        return self._create_identifier(
+            params={
+                "text_matcher": self._text_matcher.__class__.__name__,
+            },
+            score_aggregator=self._score_aggregator.__name__,  # type: ignore[ty:unresolved-attribute]
+        )
+
+    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: str | None = None) -> list[Score]:
+        """
+        Score the given request piece based on text matching strategy.
 
         Args:
             message_piece (MessagePiece): The message piece to score.
-            objective (Optional[str]): The objective to evaluate against. Defaults to None.
+            objective (str | None): The objective to evaluate against. Defaults to None.
                 Currently not used for this scorer.
 
         Returns:
             list[Score]: A list containing a single Score object with a boolean value indicating
                 whether any of the user piece values match the response.
         """
-
         memory = CentralMemory.get_memory_instance()
         user_request = memory.get_request_from_response(response=message_piece.to_message())
 
@@ -85,7 +100,7 @@ class DecodingScorer(TrueFalseScorer):
                 match_found = True
                 break
 
-        score = [
+        return [
             Score(
                 score_value=str(match_found),
                 score_value_description="",
@@ -98,5 +113,3 @@ class DecodingScorer(TrueFalseScorer):
                 objective=objective,
             )
         ]
-
-        return score

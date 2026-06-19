@@ -1,276 +1,195 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from pyrit.datasets.harmbench_multimodal_dataset import (
+from pyrit.datasets.seed_datasets.remote.harmbench_multimodal_dataset import (
     SemanticCategory,
-    fetch_harmbench_multimodal_dataset_async,
+    _HarmBenchMultimodalDataset,
 )
 from pyrit.models import SeedDataset
 
 
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("patch_central_database")
-class TestHarmBenchMultimodalDataset:
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_fetching_with_valid_inputs(self, mock_fetch, mock_fetch_image):
-        mock_examples = [
-            {
-                "Behavior": "Test harmful behavior with image",
-                "BehaviorID": "test_behavior_1",
-                "SemanticCategory": "harmful_category",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "test_image.png",
-                "ImageDescription": "A test image description",
-                "RedactedImageDescription": "A redacted test image description",
-            },
-            {
-                "Behavior": "Another harmful behavior",
-                "BehaviorID": "test_behavior_2",
-                "SemanticCategory": "illegal_activity",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "another_image.jpg",
-                "ImageDescription": "Another image description",
-                "RedactedImageDescription": "Another redacted description",
-            },
-        ]
+@pytest.fixture
+def mock_harmbench_mm_data():
+    return [
+        {
+            "Behavior": "Describe harmful content in this image",
+            "BehaviorID": "behavior_001",
+            "FunctionalCategory": "multimodal",
+            "SemanticCategory": "cybercrime_intrusion",
+            "ImageFileName": "image1.jpg",
+            "ImageDescription": "A test image",
+            "RedactedImageDescription": "Redacted description",
+        },
+        {
+            "Behavior": "Text-only behavior",
+            "BehaviorID": "behavior_002",
+            "FunctionalCategory": "standard",
+            "SemanticCategory": "illegal",
+            "ImageFileName": "image2.jpg",
+        },
+    ]
 
-        mock_fetch.return_value = mock_examples
-        mock_fetch_image.side_effect = [
-            "/dbdata/seed-prompt-entries/images/harmbench_test_behavior_1.png",
-            "/dbdata/seed-prompt-entries/images/harmbench_test_behavior_2.png",
-        ]
 
-        result = await fetch_harmbench_multimodal_dataset_async()
+async def test_fetch_dataset(mock_harmbench_mm_data):
+    loader = _HarmBenchMultimodalDataset()
 
-        assert isinstance(result, SeedDataset)
-        assert len(result.prompts) == 4  # 2 text + 2 image prompts
+    with (
+        patch.object(loader, "_fetch_from_url", return_value=mock_harmbench_mm_data),
+        patch.object(loader, "_fetch_and_save_image_async", new=AsyncMock(return_value="/path/to/image.png")),
+    ):
+        dataset = await loader.fetch_dataset_async()
 
-        text_prompts = [p for p in result.prompts if p.data_type == "text"]
-        image_prompts = [p for p in result.prompts if p.data_type == "image_path"]
-        assert len(text_prompts) == 2
-        assert len(image_prompts) == 2
+    assert isinstance(dataset, SeedDataset)
+    # Only multimodal entry => 2 prompts (image + text)
+    assert len(dataset.seeds) == 2
+    image_prompt = dataset.seeds[0]
+    text_prompt = dataset.seeds[1]
+    assert image_prompt.data_type == "image_path"
+    assert text_prompt.data_type == "text"
+    assert text_prompt.value == "Describe harmful content in this image"
 
-        # Verify each text prompt has corresponding image prompt with same group_id
-        for text_prompt in text_prompts:
-            matching_image = next(p for p in image_prompts if p.prompt_group_id == text_prompt.prompt_group_id)
-            assert matching_image is not None
-            assert text_prompt.prompt_group_id == matching_image.prompt_group_id
 
-        # Test that the prompts have correct properties set
+async def test_fetch_dataset_skips_failed_images():
+    data = [
+        {
+            "Behavior": "Describe harmful content",
+            "BehaviorID": "b001",
+            "FunctionalCategory": "multimodal",
+            "SemanticCategory": "cybercrime_intrusion",
+            "ImageFileName": "img1.jpg",
+        },
+        {
+            "Behavior": "Another harmful behavior",
+            "BehaviorID": "b002",
+            "FunctionalCategory": "multimodal",
+            "SemanticCategory": "illegal",
+            "ImageFileName": "img2.jpg",
+        },
+    ]
+    loader = _HarmBenchMultimodalDataset()
 
-        # Text properties
-        assert text_prompts[0].value == "Test harmful behavior with image"
-        assert text_prompts[0].data_type == "text"
-        assert text_prompts[0].name == "HarmBench Multimodal Text - test_behavior_1"
-        assert text_prompts[0].dataset_name == "HarmBench Multimodal Examples"
-        assert text_prompts[0].harm_categories == ["harmful_category"]
-        assert (
-            text_prompts[0].description
-            == "A text prompt from the HarmBench multimodal dataset, BehaviorID: test_behavior_1"
+    with (
+        patch.object(loader, "_fetch_from_url", return_value=data),
+        patch.object(
+            loader,
+            "_fetch_and_save_image_async",
+            new=AsyncMock(side_effect=[Exception("download failed"), "/path/to/image.png"]),
+        ),
+    ):
+        dataset = await loader.fetch_dataset_async()
+
+    # First image failed, second succeeded => 2 prompts (image + text for second)
+    assert len(dataset.seeds) == 2
+
+
+async def test_fetch_dataset_filters_by_category():
+    data = [
+        {
+            "Behavior": "Cybercrime behavior",
+            "BehaviorID": "b001",
+            "FunctionalCategory": "multimodal",
+            "SemanticCategory": "cybercrime_intrusion",
+            "ImageFileName": "img1.jpg",
+        },
+        {
+            "Behavior": "Illegal behavior",
+            "BehaviorID": "b002",
+            "FunctionalCategory": "multimodal",
+            "SemanticCategory": "illegal",
+            "ImageFileName": "img2.jpg",
+        },
+    ]
+    loader = _HarmBenchMultimodalDataset(categories=[SemanticCategory.ILLEGAL])
+
+    with (
+        patch.object(loader, "_fetch_from_url", return_value=data),
+        patch.object(loader, "_fetch_and_save_image_async", new=AsyncMock(return_value="/path/to/image.png")),
+    ):
+        dataset = await loader.fetch_dataset_async()
+
+    # Only "illegal" category matched => 2 prompts (image + text)
+    assert len(dataset.seeds) == 2
+    assert all(p.harm_categories == ["illegal"] for p in dataset.seeds)
+
+
+async def test_fetch_dataset_missing_keys_raises():
+    loader = _HarmBenchMultimodalDataset()
+    bad_data = [{"Behavior": "test"}]
+
+    with patch.object(loader, "_fetch_from_url", return_value=bad_data):
+        with pytest.raises(ValueError, match="Missing keys"):
+            await loader.fetch_dataset_async()
+
+
+def test_dataset_name():
+    loader = _HarmBenchMultimodalDataset()
+    assert loader.dataset_name == "harmbench_multimodal"
+
+
+def test_init_with_invalid_categories_raises():
+    """Test that invalid categories raise ValueError."""
+    with pytest.raises(ValueError, match="Expected SemanticCategory"):
+        _HarmBenchMultimodalDataset(categories=["not_a_category"])
+
+
+def test_init_rejects_raw_string_matching_enum_value_for_categories():
+    """Test that raw strings matching enum values are rejected."""
+    with pytest.raises(ValueError, match="Expected SemanticCategory"):
+        _HarmBenchMultimodalDataset(categories=["illegal"])
+
+
+def test_init_with_empty_categories_raises():
+    """Test that an empty categories list raises ValueError at construction."""
+    with pytest.raises(ValueError, match="`categories` must be a non-empty list"):
+        _HarmBenchMultimodalDataset(categories=[])
+
+
+async def test_fetch_and_save_image_raises_when_memory_not_configured():
+    """Test that _fetch_and_save_image_async raises RuntimeError when serializer memory is not configured."""
+    from unittest.mock import MagicMock
+
+    mock_serializer = MagicMock()
+    mock_memory = MagicMock()
+    mock_memory.results_path = None
+    mock_memory.results_storage_io = None
+    mock_serializer._memory = mock_memory
+
+    with patch(
+        "pyrit.datasets.seed_datasets.remote._image_cache.data_serializer_factory",
+        return_value=mock_serializer,
+    ):
+        loader = _HarmBenchMultimodalDataset()
+        with pytest.raises(RuntimeError, match="Serializer memory is not properly configured"):
+            await loader._fetch_and_save_image_async(behavior_id="test_id", image_url="https://example.com/img.png")
+
+
+async def test_fetch_and_save_image_returns_cached_path():
+    """Test that _fetch_and_save_image_async returns cached path when image already exists."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    mock_serializer = MagicMock()
+    mock_memory = MagicMock()
+    mock_memory.results_path = "/results"
+    mock_storage_io = AsyncMock()
+    mock_storage_io.path_exists_async = AsyncMock(return_value=True)
+    mock_memory.results_storage_io = mock_storage_io
+    mock_serializer._memory = mock_memory
+    mock_serializer.data_sub_directory = "/images"
+
+    with patch(
+        "pyrit.datasets.seed_datasets.remote._image_cache.data_serializer_factory",
+        return_value=mock_serializer,
+    ):
+        loader = _HarmBenchMultimodalDataset()
+        result = await loader._fetch_and_save_image_async(
+            behavior_id="test_id", image_url="https://example.com/img.png"
         )
-        assert text_prompts[0].sequence == 0
-        assert text_prompts[0].metadata == {"behavior_id": "test_behavior_1"}
 
-        # Image properties
-        assert image_prompts[1].value == "/dbdata/seed-prompt-entries/images/harmbench_test_behavior_2.png"
-        assert image_prompts[1].data_type == "image_path"
-        assert image_prompts[1].name == "HarmBench Multimodal Image - test_behavior_2"
-        assert image_prompts[1].dataset_name == "HarmBench Multimodal Examples"
-        assert image_prompts[1].harm_categories == ["illegal_activity"]
-        assert (
-            image_prompts[1].description
-            == "An image prompt from the HarmBench multimodal dataset, BehaviorID: test_behavior_2"
-        )
-        assert image_prompts[1].sequence == 0
-        expected_metadata = {
-            "behavior_id": "test_behavior_2",
-            "image_description": "Another image description",
-            "redacted_image_description": "Another redacted description",
-            "original_image_url": "https://raw.githubusercontent.com/centerforaisafety/HarmBench/c0423b9"
-            + "/data/multimodal_behavior_images/another_image.png",
-        }
-        assert image_prompts[1].metadata == expected_metadata
-
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_fetching_with_missing_required_keys(self, mock_fetch, mock_fetch_image):
-        mock_examples = [
-            {
-                "Behavior": "Test behavior",
-                "BehaviorID": "test_id",
-                "FunctionalCategory": "multimodal",
-                # Missing SemanticCategory and ImageFileName
-            }
-        ]
-
-        mock_fetch.return_value = mock_examples
-        with pytest.raises(ValueError, match="Missing keys in example"):
-            await fetch_harmbench_multimodal_dataset_async()
-
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_fetching_with_missing_optional_fields(self, mock_fetch, mock_fetch_image):
-        mock_examples = [
-            {
-                "Behavior": "Test behavior",
-                "BehaviorID": "test_optional",
-                "SemanticCategory": "test_category",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "test_optional.png",
-                # Missing optional fields: ImageDescription, RedactedImageDescription
-            }
-        ]
-
-        mock_fetch.return_value = mock_examples
-        mock_fetch_image.return_value = "/dbdata/seed-prompt-entries/images/harmbench_test_optional.png"
-
-        result = await fetch_harmbench_multimodal_dataset_async()
-
-        assert isinstance(result, SeedDataset)
-        assert len(result.prompts) == 2
-
-        # Verify image prompt handles missing optional fields
-        image_prompt = next(p for p in result.prompts if p.data_type == "image_path")
-        assert image_prompt.metadata["image_description"] == ""
-        assert image_prompt.metadata["redacted_image_description"] == ""
-
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_fetching_with_empty_examples(self, mock_fetch, mock_fetch_image):
-        mock_fetch.return_value = []
-
-        with pytest.raises(ValueError, match="SeedDataset cannot be empty"):
-            await fetch_harmbench_multimodal_dataset_async()
-
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_filtering_out_non_multimodal_examples(self, mock_fetch, mock_fetch_image):
-        mock_examples = [
-            {
-                "Behavior": "Text only behavior",
-                "BehaviorID": "text_only",
-                "SemanticCategory": "harmful",
-                "FunctionalCategory": "text_generation",  # Non-multimodal
-                "ImageFileName": "unused.png",
-            },
-            {
-                "Behavior": "Multimodal behavior",
-                "BehaviorID": "multimodal_id",
-                "SemanticCategory": "harmful",
-                "FunctionalCategory": "multimodal",  # This should be included
-                "ImageFileName": "valid.png",
-            },
-        ]
-
-        mock_fetch.return_value = mock_examples
-        mock_fetch_image.return_value = "/dbdata/seed-prompt-entries/images/harmbench_multimodal_id.png"
-
-        result = await fetch_harmbench_multimodal_dataset_async()
-
-        assert len(result.prompts) == 2  # one example (1 text + 1 image)
-        assert all(p.metadata["behavior_id"] == "multimodal_id" for p in result.prompts)
-
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_filtering_by_semantic_categories(self, mock_fetch, mock_fetch_image):
-        mock_examples = [
-            {
-                "Behavior": "Illegal behavior",
-                "BehaviorID": "illegal_behavior",
-                "SemanticCategory": "illegal",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "illegal.png",
-            },
-            {
-                "Behavior": "Harmful behavior",
-                "BehaviorID": "harmful_behavior",
-                "SemanticCategory": "harmful",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "harmful.png",
-            },
-            {
-                "Behavior": "Cybercrime behavior",
-                "BehaviorID": "cybercrime_behavior",
-                "SemanticCategory": "cybercrime_intrusion",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "cybercrime.png",
-            },
-            {
-                "Behavior": "Harassment behavior",
-                "BehaviorID": "harassment_behavior",
-                "SemanticCategory": "harassment_bullying",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "harassment.png",
-            },
-        ]
-        mock_fetch.return_value = mock_examples
-
-        mock_fetch_image.side_effect = [
-            "/dbdata/seed-prompt-entries/images/harmbench_illegal_behavior.png",
-            "/dbdata/seed-prompt-entries/images/harmbench_cybercrime_behavior.png",
-            "/dbdata/seed-prompt-entries/images/harmbench_harmful_behavior.png",
-        ]
-
-        # Filter by single category
-        result = await fetch_harmbench_multimodal_dataset_async(categories=[SemanticCategory.ILLEGAL])
-        assert isinstance(result, SeedDataset)
-        assert len(result.prompts) == 2  # 1 text + 1 image prompt for illegal category
-        assert all(p.metadata["behavior_id"] == "illegal_behavior" for p in result.prompts)
-        assert all(p.harm_categories == ["illegal"] for p in result.prompts)
-
-        # Filter by multiple categories
-        result = await fetch_harmbench_multimodal_dataset_async(
-            categories=[SemanticCategory.CYBERCRIME_INTRUSION, SemanticCategory.HARMFUL]
-        )
-        assert isinstance(result, SeedDataset)
-        assert len(result.prompts) == 4  # 2 examples × 2 prompts each
-        behavior_ids = {p.metadata["behavior_id"] for p in result.prompts}
-        assert behavior_ids == {"cybercrime_behavior", "harmful_behavior"}
-
-        # Filter with an empty list
-        with pytest.raises(ValueError, match="SeedDataset cannot be empty"):
-            await fetch_harmbench_multimodal_dataset_async(categories=[])
-
-    @patch("pyrit.datasets.harmbench_multimodal_dataset._fetch_and_save_image_async")
-    @patch("pyrit.datasets.harmbench_multimodal_dataset.fetch_examples")
-    async def test_skips_example_when_image_fetch_fails(self, mock_fetch, mock_fetch_image, caplog):
-        mock_examples = [
-            {
-                "Behavior": "Successful behavior",
-                "BehaviorID": "success_behavior",
-                "SemanticCategory": "harmful",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "success.png",
-            },
-            {
-                "Behavior": "Failed behavior",
-                "BehaviorID": "failed_behavior",
-                "SemanticCategory": "harmful",
-                "FunctionalCategory": "multimodal",
-                "ImageFileName": "failed.png",
-            },
-        ]
-
-        mock_fetch.return_value = mock_examples
-        mock_fetch_image.side_effect = [  # first call succeeds, second call fails
-            "/dbdata/seed-prompt-entries/images/harmbench_success_behavior.png",
-            Exception("Network error - image not found"),
-        ]
-
-        result = await fetch_harmbench_multimodal_dataset_async()
-
-        # Only the successful example should be included (1 text + 1 image = 2 prompts)
-        assert isinstance(result, SeedDataset)
-        assert len(result.prompts) == 2
-        behavior_ids = {p.metadata["behavior_id"] for p in result.prompts}
-        assert behavior_ids == {"success_behavior"}
-
-        warning_messages = [record.message for record in caplog.records if record.levelname == "WARNING"]
-        assert len(warning_messages) == 2
-        assert any("Failed to fetch image for behavior failed_behavior" in msg for msg in warning_messages)
-        assert any("Total skipped examples: 1 (image fetch failures)" in msg for msg in warning_messages)
+    expected_path = str(Path("/results") / "images" / "harmbench_test_id.png")
+    assert result == expected_path
+    assert mock_serializer.value == expected_path

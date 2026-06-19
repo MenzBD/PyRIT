@@ -1,22 +1,29 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from pyrit.executor.attack.core.attack_strategy import (
-    AttackStrategy,
-    AttackContext,
-    AttackStrategyContextT,
-    AttackStrategyResultT,
-)
+"""Core attack strategy module."""
 
 from pyrit.executor.attack.core.attack_config import (
     AttackAdversarialConfig,
     AttackConverterConfig,
     AttackScoringConfig,
+    resolve_adversarial_system_prompt,
+)
+from pyrit.executor.attack.core.attack_executor import AttackExecutor, AttackExecutorResult
+from pyrit.executor.attack.core.attack_parameters import (
+    AttackParameters,
+    AttackParamsT,
+)
+from pyrit.executor.attack.core.attack_strategy import (
+    AttackContext,
+    AttackStrategy,
+    AttackStrategyContextT,
+    AttackStrategyResultT,
 )
 
-from pyrit.executor.attack.core.attack_executor import AttackExecutor, AttackExecutorResult
-
 __all__ = [
+    "AttackParameters",
+    "AttackParamsT",
     "AttackStrategy",
     "AttackContext",
     "AttackConverterConfig",
@@ -26,4 +33,5 @@ __all__ = [
     "AttackStrategyResultT",
     "AttackExecutor",
     "AttackExecutorResult",
+    "resolve_adversarial_system_prompt",
 ]

@@ -1,8 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from pyrit.models import Score
+from pyrit.models import ComponentIdentifier, Score
 from pyrit.score import TrueFalseScoreAggregator
+
+# Reusable ScorerIdentifier for tests
+_TEST_SCORER_ID = ComponentIdentifier(
+    class_name="UnitTestScorer",
+    class_module="tests.unit.score",
+)
 
 
 def _mk_score(val: bool, *, prr_id: str, rationale: str = "") -> Score:
@@ -14,7 +20,7 @@ def _mk_score(val: bool, *, prr_id: str, rationale: str = "") -> Score:
         score_rationale=rationale,
         score_metadata=None,
         message_piece_id=prr_id,
-        scorer_class_identifier={"__type__": "UnitTestScorer"},
+        scorer_class_identifier=_TEST_SCORER_ID,
         objective=None,
     )
 
@@ -74,7 +80,7 @@ def test_category_deduplication():
             score_rationale="test1",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
         Score(
@@ -85,7 +91,7 @@ def test_category_deduplication():
             score_rationale="test2",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
     ]
@@ -105,7 +111,7 @@ def test_category_multiple_unique():
             score_rationale="test1",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
         Score(
@@ -116,7 +122,7 @@ def test_category_multiple_unique():
             score_rationale="test2",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
     ]
@@ -136,7 +142,7 @@ def test_category_empty_strings_filtered():
             score_rationale="test1",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
         Score(
@@ -147,7 +153,7 @@ def test_category_empty_strings_filtered():
             score_rationale="test2",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
     ]
@@ -166,7 +172,7 @@ def test_category_mixed_empty_and_valid():
             score_rationale="test1",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
         Score(
@@ -177,7 +183,7 @@ def test_category_mixed_empty_and_valid():
             score_rationale="test2",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
     ]
@@ -197,7 +203,7 @@ def test_category_none_and_empty_list():
             score_rationale="test1",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
         Score(
@@ -208,7 +214,7 @@ def test_category_none_and_empty_list():
             score_rationale="test2",
             score_metadata=None,
             message_piece_id="1",
-            scorer_class_identifier={"__type__": "UnitTestScorer"},
+            scorer_class_identifier=_TEST_SCORER_ID,
             objective=None,
         ),
     ]

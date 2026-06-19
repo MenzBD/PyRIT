@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from pyrit.exceptions.retry_collector import RetryCollector
+from pyrit.executor.attack.core.attack_config import AttackAdversarialConfig
+from pyrit.executor.attack.core.attack_parameters import AttackParameters
 from pyrit.executor.attack.core.attack_strategy import (
     AttackContext,
     AttackStrategy,
@@ -16,9 +19,24 @@ from pyrit.memory.central_memory import CentralMemory
 from pyrit.models import (
     AttackOutcome,
     AttackResult,
+    ComponentIdentifier,
     Message,
+    SeedPrompt,
 )
+from pyrit.models.identifiers import (
+    AtomicAttackEvaluationIdentifier,
+    AtomicAttackIdentifier,
+)
+from pyrit.models.retry_event import RetryEvent
 from pyrit.prompt_target import PromptTarget
+
+
+def _mock_target_id(name: str = "MockTarget") -> ComponentIdentifier:
+    """Helper to create ComponentIdentifier for tests."""
+    return ComponentIdentifier(
+        class_name=name,
+        class_module="test",
+    )
 
 
 @pytest.fixture
@@ -33,7 +51,7 @@ def mock_memory():
 def mock_objective_target():
     """Mock PromptTarget instance"""
     target = MagicMock(spec=PromptTarget)
-    target.get_identifier.return_value = {"__type__": "MockTarget", "__module__": "test"}
+    target.get_identifier.return_value = _mock_target_id("MockTarget")
     return target
 
 
@@ -44,25 +62,24 @@ def sample_attack_context():
     class TestAttackContext(AttackContext):
         pass
 
-    return TestAttackContext(
+    params = AttackParameters(
         objective="Test harmful objective",
         memory_labels={"test": "label"},
     )
+    return TestAttackContext(params=params)
 
 
 @pytest.fixture
 def sample_attack_result():
     """Create a sample AttackResult for testing"""
-    result = AttackResult(
+    return AttackResult(
         conversation_id="test-conversation-id",
         objective="Test objective",
-        attack_identifier={"name": "test_attack"},
         outcome=AttackOutcome.SUCCESS,
         outcome_reason="Test successful",
         execution_time_ms=0,
         executed_turns=1,
     )
-    return result
 
 
 @pytest.fixture
@@ -96,16 +113,14 @@ def mock_attack_strategy():
             pass
 
         async def _perform_async(self, *, context):
-            result = AttackResult(
+            return AttackResult(
                 conversation_id="test-conversation-id",
                 objective="Test objective",
-                attack_identifier={"name": "test_attack"},
                 outcome=AttackOutcome.SUCCESS,
                 outcome_reason="Test successful",
                 execution_time_ms=0,
                 executed_turns=1,
             )
-            return result
 
         async def _teardown_async(self, *, context):
             pass
@@ -131,7 +146,6 @@ class TestAttackStrategyInitialization:
                 return AttackResult(
                     conversation_id="test-conversation-id",
                     objective="Test objective",
-                    attack_identifier={"name": "test_attack"},
                     outcome=AttackOutcome.SUCCESS,
                     outcome_reason="Test successful",
                     execution_time_ms=0,
@@ -163,7 +177,6 @@ class TestAttackStrategyInitialization:
                 return AttackResult(
                     conversation_id="test-conversation-id",
                     objective="Test objective",
-                    attack_identifier={"name": "test_attack"},
                     outcome=AttackOutcome.SUCCESS,
                     outcome_reason="Test successful",
                     execution_time_ms=0,
@@ -195,7 +208,6 @@ class TestAttackStrategyInitialization:
                     return AttackResult(
                         conversation_id="test-conversation-id",
                         objective="Test objective",
-                        attack_identifier={"name": "test_attack"},
                         outcome=AttackOutcome.SUCCESS,
                         outcome_reason="Test successful",
                         execution_time_ms=0,
@@ -214,99 +226,63 @@ class TestAttackStrategyInitialization:
 class TestAttackStrategyExecution:
     """Tests for AttackStrategy execution methods"""
 
-    @pytest.mark.asyncio
     async def test_execute_async_with_objective_creates_context(self, mock_attack_strategy):
-        """Test that execute_async with objective parameter creates context correctly"""
+        """Test that execute_async with objective parameter creates context and executes."""
         objective = "Test objective"
         memory_labels = {"test": "value"}
 
-        # Mock the context creation and execution
-        with patch.object(mock_attack_strategy, "_context_type") as mock_context_type:
-            mock_context = MagicMock()
-            mock_context_type.return_value = mock_context
+        # Call execute_async - it should create context internally and execute
+        result = await mock_attack_strategy.execute_async(
+            objective=objective,
+            memory_labels=memory_labels,
+        )
 
-            with patch.object(mock_attack_strategy, "execute_with_context_async") as mock_execute:
-                mock_result = MagicMock(spec=AttackResult)
-                mock_execute.return_value = mock_result
+        # Verify we got a result
+        assert result is not None
+        assert isinstance(result, AttackResult)
 
-                result = await mock_attack_strategy.execute_async(objective=objective, memory_labels=memory_labels)
-
-                # Verify context was created with correct parameters
-                mock_context_type.assert_called_once()
-                call_kwargs = mock_context_type.call_args.kwargs
-                assert call_kwargs["objective"] == objective
-                assert call_kwargs["memory_labels"] == memory_labels
-
-                # Verify execute_with_context_async was called
-                mock_execute.assert_called_once_with(context=mock_context)
-                assert result == mock_result
-
-    @pytest.mark.asyncio
     async def test_execute_async_with_prepended_conversation(self, mock_attack_strategy):
-        """Test that execute_async handles prepended_conversation parameter"""
+        """Test that execute_async handles prepended_conversation parameter."""
         objective = "Test objective"
-        prepended_conversation = [MagicMock(spec=Message)]
+        prepended_conversation = [Message.from_prompt(prompt="Test", role="user")]
 
-        with patch.object(mock_attack_strategy, "_context_type") as mock_context_type:
-            mock_context = MagicMock()
-            mock_context_type.return_value = mock_context
+        # This should work without errors
+        result = await mock_attack_strategy.execute_async(
+            objective=objective,
+            prepended_conversation=prepended_conversation,
+        )
 
-            with patch.object(mock_attack_strategy, "execute_with_context_async") as mock_execute:
-                mock_result = MagicMock(spec=AttackResult)
-                mock_execute.return_value = mock_result
+        assert result is not None
 
-                await mock_attack_strategy.execute_async(
-                    objective=objective, prepended_conversation=prepended_conversation
-                )
+    async def test_execute_async_requires_objective(self, mock_attack_strategy):
+        """Test that execute_async requires objective parameter."""
+        with pytest.raises(ValueError, match="objective is required"):
+            await mock_attack_strategy.execute_async()
 
-                # Verify context was created with prepended_conversation
-                call_kwargs = mock_context_type.call_args.kwargs
-                assert call_kwargs["objective"] == objective
-                assert call_kwargs["prepended_conversation"] == prepended_conversation
-
-    @pytest.mark.asyncio
-    async def test_execute_async_validates_objective_type(self, mock_attack_strategy):
-        """Test that execute_async validates objective parameter type"""
-        with pytest.raises(Exception):  # get_kwarg_param should raise for invalid type
-            await mock_attack_strategy.execute_async(objective=123)  # Should be string
-
-    @pytest.mark.asyncio
-    async def test_execute_async_validates_memory_labels_type(self, mock_attack_strategy):
-        """Test that execute_async validates memory_labels parameter type"""
-        with pytest.raises(Exception):  # get_kwarg_param should raise for invalid type
+    async def test_execute_async_rejects_unknown_params(self, mock_attack_strategy):
+        """Test that execute_async rejects unknown parameters."""
+        with pytest.raises(ValueError, match="does not accept parameters"):
             await mock_attack_strategy.execute_async(
-                objective="Test objective", memory_labels="invalid"  # Should be dict
+                objective="Test",
+                unknown_param="value",
             )
 
-    @pytest.mark.asyncio
-    async def test_execute_async_allows_optional_parameters(self, mock_attack_strategy):
-        """Test that execute_async works with optional parameters as None"""
-        objective = "Test objective"
+    async def test_execute_async_allows_optional_parameters_as_none(self, mock_attack_strategy):
+        """Test that execute_async works with optional parameters as None."""
+        # None values should be skipped, not cause errors
+        result = await mock_attack_strategy.execute_async(
+            objective="Test objective",
+            memory_labels=None,
+            prepended_conversation=None,
+        )
 
-        with patch.object(mock_attack_strategy, "_context_type") as mock_context_type:
-            mock_context = MagicMock()
-            mock_context_type.return_value = mock_context
-
-            with patch.object(mock_attack_strategy, "execute_with_context_async") as mock_execute:
-                mock_result = MagicMock(spec=AttackResult)
-                mock_execute.return_value = mock_result
-
-                await mock_attack_strategy.execute_async(
-                    objective=objective, memory_labels=None, prepended_conversation=None
-                )
-
-                # Verify context was created correctly
-                call_kwargs = mock_context_type.call_args.kwargs
-                assert call_kwargs["objective"] == objective
-                assert call_kwargs["memory_labels"] is None
-                assert call_kwargs.get("prepended_conversation") is None
+        assert result is not None
 
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestDefaultAttackStrategyEventHandler:
     """Tests for the default attack strategy event handler"""
 
-    @pytest.mark.asyncio
     async def test_on_pre_execute_sets_start_time(self, event_handler, sample_attack_context, mock_logger):
         """Test that pre-execute handler sets start time"""
         event_data = StrategyEventData(
@@ -317,11 +293,10 @@ class TestDefaultAttackStrategyEventHandler:
         )
 
         with patch("time.perf_counter", return_value=123.456):
-            await event_handler.on_event(event_data)
+            await event_handler.on_event_async(event_data)
 
         assert sample_attack_context.start_time == 123.456
 
-    @pytest.mark.asyncio
     async def test_on_pre_execute_logs_objective(self, event_handler, sample_attack_context, mock_logger):
         """Test that pre-execute handler logs the objective"""
         event_data = StrategyEventData(
@@ -331,10 +306,9 @@ class TestDefaultAttackStrategyEventHandler:
             context=sample_attack_context,
         )
 
-        await event_handler.on_event(event_data)
+        await event_handler.on_event_async(event_data)
         mock_logger.info.assert_called_once_with(f"Starting attack: {sample_attack_context.objective}")
 
-    @pytest.mark.asyncio
     async def test_on_pre_execute_raises_on_none_context(self, event_handler, mock_logger):
         """Test that pre-execute handler raises error for None context"""
         # Create a dummy context that we'll set to None in the event data
@@ -350,9 +324,8 @@ class TestDefaultAttackStrategyEventHandler:
         event_data.context = None
 
         with pytest.raises(ValueError, match="Attack context is None"):
-            await event_handler.on_event(event_data)
+            await event_handler.on_event_async(event_data)
 
-    @pytest.mark.asyncio
     async def test_on_post_execute_calculates_execution_time(
         self, event_handler, sample_attack_context, sample_attack_result, mock_logger
     ):
@@ -368,11 +341,10 @@ class TestDefaultAttackStrategyEventHandler:
         )
 
         with patch("time.perf_counter", return_value=100.5):  # 500ms later
-            await event_handler.on_event(event_data)
+            await event_handler.on_event_async(event_data)
 
         assert sample_attack_result.execution_time_ms == 500
 
-    @pytest.mark.asyncio
     async def test_on_post_execute_logs_success(
         self, event_handler, sample_attack_context, sample_attack_result, mock_logger
     ):
@@ -388,12 +360,11 @@ class TestDefaultAttackStrategyEventHandler:
             result=sample_attack_result,
         )
 
-        await event_handler.on_event(event_data)
+        await event_handler.on_event_async(event_data)
 
         expected_message = f"{event_handler.__class__.__name__} achieved the objective. Reason: Test successful"
         mock_logger.info.assert_called_with(expected_message)
 
-    @pytest.mark.asyncio
     async def test_on_post_execute_logs_failure(
         self, event_handler, sample_attack_context, sample_attack_result, mock_logger
     ):
@@ -409,12 +380,11 @@ class TestDefaultAttackStrategyEventHandler:
             result=sample_attack_result,
         )
 
-        await event_handler.on_event(event_data)
+        await event_handler.on_event_async(event_data)
 
         expected_message = f"{event_handler.__class__.__name__} did not achieve the objective. Reason: Test failed"
         mock_logger.info.assert_called_with(expected_message)
 
-    @pytest.mark.asyncio
     async def test_on_post_execute_logs_undetermined(
         self, event_handler, sample_attack_context, sample_attack_result, mock_logger
     ):
@@ -430,12 +400,31 @@ class TestDefaultAttackStrategyEventHandler:
             result=sample_attack_result,
         )
 
-        await event_handler.on_event(event_data)
+        await event_handler.on_event_async(event_data)
 
         expected_message = f"{event_handler.__class__.__name__} outcome is undetermined. Reason: Not specified"
         mock_logger.info.assert_called_with(expected_message)
 
-    @pytest.mark.asyncio
+    async def test_on_post_execute_logs_error_outcome(
+        self, event_handler, sample_attack_context, sample_attack_result, mock_logger
+    ):
+        """Test that post-execute handler logs error outcome"""
+        sample_attack_result.outcome = AttackOutcome.ERROR
+        sample_attack_result.outcome_reason = "Connection timeout"
+
+        event_data = StrategyEventData(
+            event=StrategyEvent.ON_POST_EXECUTE,
+            strategy_name="TestStrategy",
+            strategy_id="test-id",
+            context=sample_attack_context,
+            result=sample_attack_result,
+        )
+
+        await event_handler.on_event_async(event_data)
+
+        expected_message = f"{event_handler.__class__.__name__} failed with an error. Reason: Connection timeout"
+        mock_logger.info.assert_called_with(expected_message)
+
     async def test_on_post_execute_adds_results_to_memory(self, mock_memory):
         """Test that post-execute handler adds results to memory"""
         with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
@@ -443,7 +432,11 @@ class TestDefaultAttackStrategyEventHandler:
 
             sample_context = MagicMock()
             sample_context.start_time = 100.0
-            sample_result = MagicMock(spec=AttackResult)
+            sample_result = AttackResult(
+                conversation_id="conv-id",
+                objective="test objective",
+                outcome=AttackOutcome.SUCCESS,
+            )
 
             event_data = StrategyEventData(
                 event=StrategyEvent.ON_POST_EXECUTE,
@@ -454,11 +447,10 @@ class TestDefaultAttackStrategyEventHandler:
             )
 
             with patch("time.perf_counter", return_value=100.1):
-                await handler.on_event(event_data)
+                await handler.on_event_async(event_data)
 
             mock_memory.add_attack_results_to_memory.assert_called_once_with(attack_results=[sample_result])
 
-    @pytest.mark.asyncio
     async def test_on_post_execute_raises_on_none_result(self, event_handler, sample_attack_context, mock_logger):
         """Test that post-execute handler raises error for None result"""
         # Create a dummy result that we'll set to None
@@ -475,11 +467,145 @@ class TestDefaultAttackStrategyEventHandler:
         event_data.result = None
 
         with pytest.raises(ValueError, match="Attack result is None"):
-            await event_handler.on_event(event_data)
+            await event_handler.on_event_async(event_data)
 
-    @pytest.mark.asyncio
+    async def test_on_post_execute_attaches_retry_events(
+        self, sample_attack_context, sample_attack_result, mock_memory
+    ):
+        """Test that post-execute handler attaches retry events from collector to the result"""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+
+            sample_attack_context.start_time = 100.0
+            retry_event = RetryEvent(
+                attempt_number=1, function_name="send_prompt_async", exception_type="RateLimitError"
+            )
+
+            collector = RetryCollector(events=[retry_event])
+            with patch("pyrit.executor.attack.core.attack_strategy.get_retry_collector", return_value=collector):
+                event_data = StrategyEventData(
+                    event=StrategyEvent.ON_POST_EXECUTE,
+                    strategy_name="TestStrategy",
+                    strategy_id="test-id",
+                    context=sample_attack_context,
+                    result=sample_attack_result,
+                )
+                await handler.on_event_async(event_data)
+
+            assert sample_attack_result.retry_events == [retry_event]
+            assert sample_attack_result.total_retries == 1
+
+    async def test_on_post_execute_no_retry_events_when_collector_empty(
+        self, sample_attack_context, sample_attack_result, mock_memory
+    ):
+        """Test that post-execute handler does not set retry_events when collector has no events"""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+
+            sample_attack_context.start_time = 100.0
+            collector = RetryCollector(events=[])
+            with patch("pyrit.executor.attack.core.attack_strategy.get_retry_collector", return_value=collector):
+                event_data = StrategyEventData(
+                    event=StrategyEvent.ON_POST_EXECUTE,
+                    strategy_name="TestStrategy",
+                    strategy_id="test-id",
+                    context=sample_attack_context,
+                    result=sample_attack_result,
+                )
+                await handler.on_event_async(event_data)
+
+            # Empty collector means the guard `if collector and collector.events` is False
+            assert not sample_attack_result.retry_events
+            assert sample_attack_result.total_retries == 0
+
+    async def test_on_error_attaches_retry_events(self, sample_attack_context, mock_memory):
+        """Test that error handler attaches collected retry events to the error AttackResult"""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+
+            sample_attack_context.start_time = 100.0
+            retry_event = RetryEvent(attempt_number=2, function_name="send_prompt_async", exception_type="TimeoutError")
+            collector = RetryCollector(events=[retry_event])
+
+            with patch("pyrit.executor.attack.core.attack_strategy.get_retry_collector", return_value=collector):
+                event_data = StrategyEventData(
+                    event=StrategyEvent.ON_ERROR,
+                    strategy_name="TestStrategy",
+                    strategy_id="test-id",
+                    context=sample_attack_context,
+                    error=RuntimeError("test error"),
+                )
+                await handler.on_event_async(event_data)
+
+            stored_result = mock_memory.add_attack_results_to_memory.call_args.kwargs["attack_results"][0]
+            assert stored_result.outcome == AttackOutcome.ERROR
+            assert stored_result.retry_events == [retry_event]
+            assert stored_result.total_retries == 1
+
+    async def test_on_error_empty_retry_events_when_no_collector(self, sample_attack_context, mock_memory):
+        """Test that error handler sets empty retry_events when no collector exists"""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+
+            sample_attack_context.start_time = 100.0
+
+            with patch("pyrit.executor.attack.core.attack_strategy.get_retry_collector", return_value=None):
+                event_data = StrategyEventData(
+                    event=StrategyEvent.ON_ERROR,
+                    strategy_name="TestStrategy",
+                    strategy_id="test-id",
+                    context=sample_attack_context,
+                    error=RuntimeError("test error"),
+                )
+                await handler.on_event_async(event_data)
+
+            stored_result = mock_memory.add_attack_results_to_memory.call_args.kwargs["attack_results"][0]
+            assert stored_result.retry_events == []
+            assert stored_result.total_retries == 0
+
+    async def test_on_error_persists_result_to_memory(self, sample_attack_context, mock_memory):
+        """Test that error handler creates an error AttackResult and persists it"""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+
+            sample_attack_context.start_time = 100.0
+            error = ValueError("something broke")
+
+            with patch("pyrit.executor.attack.core.attack_strategy.get_retry_collector", return_value=None):
+                event_data = StrategyEventData(
+                    event=StrategyEvent.ON_ERROR,
+                    strategy_name="TestStrategy",
+                    strategy_id="test-id",
+                    context=sample_attack_context,
+                    error=error,
+                )
+                with patch("time.perf_counter", return_value=100.5):
+                    await handler.on_event_async(event_data)
+
+            mock_memory.add_attack_results_to_memory.assert_called_once()
+            stored_result = mock_memory.add_attack_results_to_memory.call_args.kwargs["attack_results"][0]
+            assert stored_result.outcome == AttackOutcome.ERROR
+            assert stored_result.error_message == "something broke"
+            assert stored_result.error_type == "ValueError"
+            assert stored_result.execution_time_ms == 500
+
+    async def test_on_error_skips_when_no_error_or_context(self, mock_memory):
+        """Test that error handler returns early when error or context is None"""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_ERROR,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=None,
+                error=RuntimeError("test"),
+            )
+            await handler.on_event_async(event_data)
+            mock_memory.add_attack_results_to_memory.assert_not_called()
+
     async def test_on_event_handles_other_events(self, event_handler, sample_attack_context, mock_logger):
-        """Test that on_event handles events not in the specific handlers"""
+        """Test that on_event_async handles events not in the specific handlers"""
         event_data = StrategyEventData(
             event=StrategyEvent.ON_PRE_VALIDATE,  # Not specifically handled
             strategy_name="TestStrategy",
@@ -487,19 +613,174 @@ class TestDefaultAttackStrategyEventHandler:
             context=sample_attack_context,
         )
 
-        await event_handler.on_event(event_data)
+        await event_handler.on_event_async(event_data)
 
-        # Should call the generic _on method and log debug message
+        # Should call the generic _on_async method and log debug message
         mock_logger.debug.assert_called_once_with(
             f"Attack is in '{StrategyEvent.ON_PRE_VALIDATE.value}' stage for {event_handler.__class__.__name__}"
         )
+
+    async def test_on_post_execute_stamps_scenario_attribution_when_present(
+        self, sample_attack_context, sample_attack_result, mock_memory
+    ):
+        """When the context carries an AttackResultAttribution, the persisted
+        AttackResult must have attribution_parent_id + attribution_data populated."""
+        from pyrit.executor.attack.core.attack_result_attribution import AttackResultAttribution
+
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+            sample_attack_context.start_time = 100.0
+            sample_attack_context._attribution = AttackResultAttribution(
+                parent_id="scenario-1",
+                parent_collection="atomic_a",
+            )
+
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_POST_EXECUTE,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=sample_attack_context,
+                result=sample_attack_result,
+            )
+            await handler.on_event_async(event_data)
+
+        assert sample_attack_result.attribution_parent_id == "scenario-1"
+        assert sample_attack_result.attribution_data == {
+            "parent_collection": "atomic_a",
+        }
+
+    async def test_on_post_execute_no_attribution_leaves_fields_none(
+        self, sample_attack_context, sample_attack_result, mock_memory
+    ):
+        """Outside a Scenario, _attribution is None and the attribution fields
+        on the persisted AttackResult must stay None."""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+            sample_attack_context.start_time = 100.0
+            # _attribution defaults to None — no scenario stamping should happen.
+
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_POST_EXECUTE,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=sample_attack_context,
+                result=sample_attack_result,
+            )
+            await handler.on_event_async(event_data)
+
+        assert sample_attack_result.attribution_parent_id is None
+        assert sample_attack_result.attribution_data is None
+
+    async def test_on_error_stamps_scenario_attribution_when_present(self, sample_attack_context, mock_memory):
+        """Error AttackResults must also carry the attribution foreign key so
+        error lookups via get_attack_results(scenario_result_id=..., outcome=ERROR) work."""
+        from pyrit.executor.attack.core.attack_result_attribution import AttackResultAttribution
+
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+            sample_attack_context.start_time = 100.0
+            sample_attack_context._attribution = AttackResultAttribution(
+                parent_id="scenario-err",
+                parent_collection="atomic_err",
+            )
+
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_ERROR,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=sample_attack_context,
+                error=RuntimeError("boom"),
+            )
+            await handler.on_event_async(event_data)
+
+        # The error AttackResult was persisted; inspect what was sent to memory.
+        call = mock_memory.add_attack_results_to_memory.call_args
+        persisted = call.kwargs["attack_results"][0]
+        assert persisted.outcome == AttackOutcome.ERROR
+        assert persisted.attribution_parent_id == "scenario-err"
+        assert persisted.attribution_data == {
+            "parent_collection": "atomic_err",
+        }
+
+    async def test_on_post_execute_stamps_targeted_harm_categories(self, sample_attack_result, mock_memory):
+        """Harm categories from context.params are stamped onto the persisted result."""
+
+        class TestAttackContext(AttackContext):
+            pass
+
+        params = AttackParameters(
+            objective="Test harmful objective",
+            targeted_harm_categories=["violence", "hate"],
+        )
+        context = TestAttackContext(params=params)
+        context.start_time = 100.0
+
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_POST_EXECUTE,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=context,
+                result=sample_attack_result,
+            )
+            await handler.on_event_async(event_data)
+
+        assert sorted(sample_attack_result.targeted_harm_categories) == ["hate", "violence"]
+
+    async def test_on_post_execute_no_harm_categories_leaves_empty(
+        self, sample_attack_context, sample_attack_result, mock_memory
+    ):
+        """With no harm categories on params, the result's list stays empty."""
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+            sample_attack_context.start_time = 100.0
+
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_POST_EXECUTE,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=sample_attack_context,
+                result=sample_attack_result,
+            )
+            await handler.on_event_async(event_data)
+
+        assert sample_attack_result.targeted_harm_categories == []
+
+    async def test_on_error_stamps_targeted_harm_categories(self, mock_memory):
+        """Error AttackResults must also carry the targeted harm categories."""
+
+        class TestAttackContext(AttackContext):
+            pass
+
+        params = AttackParameters(
+            objective="Test harmful objective",
+            targeted_harm_categories=["self_harm"],
+        )
+        context = TestAttackContext(params=params)
+        context.start_time = 100.0
+
+        with patch("pyrit.memory.central_memory.CentralMemory.get_memory_instance", return_value=mock_memory):
+            handler = _DefaultAttackStrategyEventHandler()
+            event_data = StrategyEventData(
+                event=StrategyEvent.ON_ERROR,
+                strategy_name="TestStrategy",
+                strategy_id="test-id",
+                context=context,
+                error=RuntimeError("boom"),
+            )
+            await handler.on_event_async(event_data)
+
+        call = mock_memory.add_attack_results_to_memory.call_args
+        persisted = call.kwargs["attack_results"][0]
+        assert persisted.outcome == AttackOutcome.ERROR
+        assert persisted.targeted_harm_categories == ["self_harm"]
 
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestAttackStrategyIntegration:
     """Integration tests for AttackStrategy with event handlers"""
 
-    @pytest.mark.asyncio
     async def test_attack_strategy_event_flow(self, mock_memory, mock_objective_target):
         """Test that AttackStrategy properly triggers events during execution"""
 
@@ -511,15 +792,13 @@ class TestAttackStrategyIntegration:
                 pass
 
             async def _perform_async(self, *, context):
-                result = AttackResult(
+                return AttackResult(
                     conversation_id="test-conversation-id",
                     objective="Test objective",
-                    attack_identifier={"name": "test_attack"},
                     outcome=AttackOutcome.SUCCESS,
                     outcome_reason="Test successful",
                     executed_turns=1,
                 )
-                return result
 
             async def _teardown_async(self, *, context):
                 pass
@@ -538,13 +817,12 @@ class TestAttackStrategyIntegration:
         # Current behavior: execution_time_ms is not modified by event handler
         assert result.execution_time_ms == 500
 
-    @pytest.mark.asyncio
     async def test_attack_strategy_with_custom_event_handler(self, mock_objective_target):
         """Test that AttackStrategy can work with custom event handlers"""
         custom_handler_called = False
 
         class CustomEventHandler:
-            async def on_event(self, event_data):
+            async def on_event_async(self, event_data):
                 nonlocal custom_handler_called
                 custom_handler_called = True
 
@@ -556,16 +834,14 @@ class TestAttackStrategyIntegration:
                 pass
 
             async def _perform_async(self, *, context):
-                result = AttackResult(
+                return AttackResult(
                     conversation_id="test-conversation-id",
                     objective="Test objective",
-                    attack_identifier={"name": "test_attack"},
                     outcome=AttackOutcome.SUCCESS,
                     outcome_reason="Test successful",
                     execution_time_ms=0,
                     executed_turns=1,
                 )
-                return result
 
             async def _teardown_async(self, *, context):
                 pass
@@ -577,3 +853,161 @@ class TestAttackStrategyIntegration:
         # The default handler should still be present
         assert len(strategy._event_handlers) == 1
         assert "_DefaultAttackStrategyEventHandler" in strategy._event_handlers
+
+
+def _adv_target(*, model_name: str = "gpt-adv", extra_params: dict | None = None) -> PromptTarget:
+    """Build a mock adversarial chat target whose identifier carries the given params."""
+    target = MagicMock(spec=PromptTarget)
+    params: dict = {"model_name": model_name}
+    if extra_params:
+        params.update(extra_params)
+    target.get_identifier.return_value = ComponentIdentifier(class_name="AdvChat", class_module="test", params=params)
+    return target
+
+
+class _IdentityTestStrategy(AttackStrategy):
+    """Minimal concrete strategy that exposes a settable adversarial config for identity tests."""
+
+    def __init__(self, *, objective_target, adversarial_config=None):
+        super().__init__(context_type=AttackContext, objective_target=objective_target)
+        self._test_adversarial_config = adversarial_config
+
+    def _validate_context(self, *, context):
+        pass
+
+    async def _setup_async(self, *, context):
+        pass
+
+    async def _perform_async(self, *, context):
+        return AttackResult(
+            conversation_id="c",
+            objective="o",
+            outcome=AttackOutcome.SUCCESS,
+            outcome_reason="ok",
+            execution_time_ms=0,
+            executed_turns=1,
+        )
+
+    async def _teardown_async(self, *, context):
+        pass
+
+    def get_attack_adversarial_config(self):
+        return self._test_adversarial_config
+
+
+def _eval_hash(attack_identifier: ComponentIdentifier) -> str:
+    composite = AtomicAttackIdentifier.build(attack_identifier=attack_identifier)
+    return AtomicAttackEvaluationIdentifier(composite).eval_hash
+
+
+@pytest.mark.usefixtures("patch_central_database")
+class TestCreateIdentifierAdversarial:
+    """Tests for adversarial config wiring into the attack identifier (component + eval hash)."""
+
+    def test_base_returns_none_omits_adversarial_child_and_params(self, mock_objective_target):
+        """When get_attack_adversarial_config() returns None, no adversarial child/params appear."""
+        strategy = _IdentityTestStrategy(objective_target=mock_objective_target, adversarial_config=None)
+        identifier = strategy.get_identifier()
+        assert "adversarial_chat" not in identifier.children
+        assert "adversarial_system_prompt" not in identifier.params
+        assert "adversarial_seed_prompt" not in identifier.params
+
+    def test_adversarial_target_added_as_child(self, mock_objective_target):
+        adv = _adv_target()
+        config = AttackAdversarialConfig(target=adv, system_prompt=None, seed_prompt=None)
+        strategy = _IdentityTestStrategy(objective_target=mock_objective_target, adversarial_config=config)
+        identifier = strategy.get_identifier()
+        assert identifier.children["adversarial_chat"] == adv.get_identifier.return_value
+
+    def test_target_only_config_omits_prompt_params(self, mock_objective_target):
+        """A target-only config (no prompts) emits the child but no prompt params."""
+        config = AttackAdversarialConfig(target=_adv_target(), system_prompt=None, seed_prompt=None)
+        strategy = _IdentityTestStrategy(objective_target=mock_objective_target, adversarial_config=config)
+        identifier = strategy.get_identifier()
+        assert "adversarial_chat" in identifier.children
+        assert "adversarial_system_prompt" not in identifier.params
+        assert "adversarial_seed_prompt" not in identifier.params
+
+    def test_system_prompt_string_stored_in_params(self, mock_objective_target):
+        config = AttackAdversarialConfig(
+            target=_adv_target(), system_prompt="persona {{ objective }}", seed_prompt=None
+        )
+        strategy = _IdentityTestStrategy(objective_target=mock_objective_target, adversarial_config=config)
+        identifier = strategy.get_identifier()
+        assert identifier.params["adversarial_system_prompt"] == "persona {{ objective }}"
+
+    def test_seed_prompt_seedprompt_value_stored_in_params(self, mock_objective_target):
+        seed = SeedPrompt(value="seed {{ objective }}", data_type="text", parameters=["objective"])
+        config = AttackAdversarialConfig(target=_adv_target(), system_prompt=None, seed_prompt=seed)
+        strategy = _IdentityTestStrategy(objective_target=mock_objective_target, adversarial_config=config)
+        identifier = strategy.get_identifier()
+        assert identifier.params["adversarial_seed_prompt"] == "seed {{ objective }}"
+
+    def test_different_system_prompt_changes_full_and_eval_hash(self, mock_objective_target):
+        adv = _adv_target()
+        s1 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(target=adv, system_prompt="persona A", seed_prompt=None),
+        )
+        s2 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(target=adv, system_prompt="persona B", seed_prompt=None),
+        )
+        id1, id2 = s1.get_identifier(), s2.get_identifier()
+        assert id1.hash != id2.hash
+        assert _eval_hash(id1) != _eval_hash(id2)
+
+    def test_different_seed_prompt_changes_full_and_eval_hash(self, mock_objective_target):
+        adv = _adv_target()
+        s1 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(target=adv, system_prompt=None, seed_prompt="first A"),
+        )
+        s2 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(target=adv, system_prompt=None, seed_prompt="first B"),
+        )
+        id1, id2 = s1.get_identifier(), s2.get_identifier()
+        assert id1.hash != id2.hash
+        assert _eval_hash(id1) != _eval_hash(id2)
+
+    def test_different_adversarial_model_changes_eval_hash(self, mock_objective_target):
+        """model_name is in the adversarial_chat eval allowlist -> different eval hash."""
+        s1 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(
+                target=_adv_target(model_name="gpt-4o"), system_prompt=None, seed_prompt=None
+            ),
+        )
+        s2 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(
+                target=_adv_target(model_name="gpt-3.5"), system_prompt=None, seed_prompt=None
+            ),
+        )
+        assert _eval_hash(s1.get_identifier()) != _eval_hash(s2.get_identifier())
+
+    def test_adversarial_endpoint_does_not_change_eval_hash(self, mock_objective_target):
+        """endpoint is NOT in the adversarial_chat eval allowlist -> same eval hash."""
+        s1 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(
+                target=_adv_target(extra_params={"endpoint": "https://a.com"}), system_prompt=None, seed_prompt=None
+            ),
+        )
+        s2 = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(
+                target=_adv_target(extra_params={"endpoint": "https://b.com"}), system_prompt=None, seed_prompt=None
+            ),
+        )
+        assert _eval_hash(s1.get_identifier()) == _eval_hash(s2.get_identifier())
+
+    def test_adversarial_presence_changes_hash_vs_none(self, mock_objective_target):
+        """An attack with an adversarial child must not collide with one that has none."""
+        plain = _IdentityTestStrategy(objective_target=mock_objective_target, adversarial_config=None)
+        adversarial = _IdentityTestStrategy(
+            objective_target=mock_objective_target,
+            adversarial_config=AttackAdversarialConfig(target=_adv_target(), system_prompt=None, seed_prompt=None),
+        )
+        assert plain.get_identifier().hash != adversarial.get_identifier().hash

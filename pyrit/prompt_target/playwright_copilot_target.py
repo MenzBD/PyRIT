@@ -4,29 +4,30 @@
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
-from pyrit.models import (
-    Message,
-    MessagePiece,
-    construct_response_from_request,
-    data_serializer_factory,
-)
+from pyrit.memory import data_serializer_factory
+from pyrit.models import ComponentIdentifier, Message, MessagePiece, construct_response_from_request
 from pyrit.models.literals import PromptDataType
 from pyrit.prompt_target.common.prompt_target import PromptTarget
+from pyrit.prompt_target.common.target_capabilities import TargetCapabilities
+from pyrit.prompt_target.common.target_configuration import TargetConfiguration
 
 logger = logging.getLogger(__name__)
 
 # Avoid errors for users who don't have playwright installed
 if TYPE_CHECKING:
-    from playwright.async_api import Page
+    from playwright.async_api import Page  # type: ignore[ty:unresolved-import]
 else:
     Page = None
 
 
 class CopilotType(Enum):
+    """Enumeration of Copilot interface types."""
+
     CONSUMER = "consumer"
     M365 = "m365"
 
@@ -74,6 +75,25 @@ class PlaywrightCopilotTarget(PromptTarget):
 
     # Supported data types
     SUPPORTED_DATA_TYPES = {"text", "image_path"}
+    _DEFAULT_CONFIGURATION: TargetConfiguration = TargetConfiguration(
+        capabilities=TargetCapabilities(
+            supports_multi_turn=True,
+            supports_multi_message_pieces=True,
+            input_modalities=frozenset(
+                {
+                    frozenset(["text"]),
+                    frozenset(["text", "image_path"]),
+                }
+            ),
+            output_modalities=frozenset(
+                {
+                    frozenset(["text"]),
+                    frozenset(["image_path"]),
+                    frozenset(["text", "image_path"]),
+                }
+            ),
+        )
+    )
 
     # Placeholder text constants
     PLACEHOLDER_GENERATING_RESPONSE: str = "generating response"
@@ -98,8 +118,28 @@ class PlaywrightCopilotTarget(PromptTarget):
     # Login requirement message
     LOGIN_REQUIRED_HEADER: str = "Sign in for the full experience"
 
-    def __init__(self, *, page: "Page", copilot_type: CopilotType = CopilotType.CONSUMER) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        *,
+        page: "Page",
+        copilot_type: CopilotType = CopilotType.CONSUMER,
+        custom_configuration: TargetConfiguration | None = None,
+    ) -> None:
+        """
+        Initialize the Playwright Copilot target.
+
+        Args:
+            page (Page): The Playwright page object for browser interaction.
+            copilot_type (CopilotType): The type of Copilot to interact with.
+                Defaults to CopilotType.CONSUMER.
+            custom_configuration (TargetConfiguration, Optional): Override the default configuration for
+                this target instance. Defaults to None.
+
+        Raises:
+            RuntimeError: If the Playwright page is not initialized.
+            ValueError: If the page URL doesn't match the specified copilot_type.
+        """
+        super().__init__(custom_configuration=custom_configuration)
         self._page = page
         self._type = copilot_type
 
@@ -114,8 +154,26 @@ class PlaywrightCopilotTarget(PromptTarget):
         if page and self.M365_URL_IDENTIFIER not in page.url and copilot_type == CopilotType.M365:
             raise ValueError("The provided page URL does not indicate M365 Copilot, but the type is set to m365.")
 
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier with Copilot-specific parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this target instance.
+        """
+        return self._create_identifier(
+            params={
+                "copilot_type": self._type.value,
+            },
+        )
+
     def _get_selectors(self) -> CopilotSelectors:
-        """Get the appropriate selectors for the current Copilot type."""
+        """
+        Get the appropriate selectors for the current Copilot type.
+
+        Returns:
+            CopilotSelectors: The selectors for the Copilot interface.
+        """
         if self._type == CopilotType.CONSUMER:
             return CopilotSelectors(
                 input_selector="#userInput",
@@ -126,33 +184,35 @@ class PlaywrightCopilotTarget(PromptTarget):
                 plus_button_dropdown_selector='button[aria-label="Open"]',
                 file_picker_selector='button[aria-label="Add images or files"]',
             )
-        else:  # M365 Copilot
-            return CopilotSelectors(
-                input_selector='span[role="textbox"][contenteditable="true"][aria-label="Message Copilot"]',
-                send_button_selector='button[type="submit"]',
-                ai_messages_selector='div[data-testid="copilot-message-div"]',
-                ai_messages_group_selector=(
-                    'div[data-testid="copilot-message-div"] > div > div > div > '
-                    "div > div > div > div > div > div > div"
-                ),
-                text_content_selector="div > p",
-                plus_button_dropdown_selector='button[aria-label="Add content"]',
-                file_picker_selector='span.fui-MenuItem__content:has-text("Upload images and files")',
-            )
+        # M365 Copilot
+        return CopilotSelectors(
+            input_selector='span[role="textbox"][contenteditable="true"][aria-label="Message Copilot"]',
+            send_button_selector='button[type="submit"]',
+            ai_messages_selector='div[data-testid="copilot-message-div"]',
+            ai_messages_group_selector=(
+                'div[data-testid="copilot-message-div"] > div > div > div > div > div > div > div > div > div > div'
+            ),
+            text_content_selector="div > p",
+            plus_button_dropdown_selector='button[aria-label="Add content"]',
+            file_picker_selector='span.fui-MenuItem__content:has-text("Upload images and files")',
+        )
 
-    async def send_prompt_async(self, *, message: Message) -> Message:
+    async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
         """
         Send a message to Microsoft Copilot and return the response.
 
         Args:
-            message (Message): The message to send. Can contain multiple pieces
-                of type 'text' or 'image_path'.
+            normalized_conversation (list[Message]): The full conversation
+                (history + current message) after running the normalization
+                pipeline. The current message is the last element.
 
         Returns:
-            Message: The response from Copilot. May contain multiple
-                pieces if the response includes both text and images.
+            list[Message]: A list containing the response from Copilot.
+
+        Raises:
+            RuntimeError: If an error occurs during interaction.
         """
-        self._validate_request(message=message)
+        message = normalized_conversation[-1]
 
         try:
             response_content = await self._interact_with_copilot_async(message)
@@ -175,9 +235,7 @@ class PlaywrightCopilotTarget(PromptTarget):
                     role="assistant",
                     original_value=piece_data,
                     conversation_id=request_piece.conversation_id,
-                    labels=request_piece.labels,
-                    prompt_target_identifier=request_piece.prompt_target_identifier,
-                    attack_identifier=request_piece.attack_identifier,
+                    labels=request_piece.labels,  # deprecated
                     original_value_data_type=piece_type,
                     converted_value_data_type=piece_type,
                     prompt_metadata=request_piece.prompt_metadata,
@@ -187,10 +245,19 @@ class PlaywrightCopilotTarget(PromptTarget):
 
             response_entry = Message(message_pieces=response_message_pieces)
 
-        return response_entry
+        return [response_entry]
 
-    async def _interact_with_copilot_async(self, message: Message) -> Union[str, List[Tuple[str, PromptDataType]]]:
-        """Interact with Microsoft Copilot interface to send multimodal prompts."""
+    async def _interact_with_copilot_async(self, message: Message) -> str | list[tuple[str, PromptDataType]]:
+        """
+        Interact with Microsoft Copilot interface to send multimodal prompts.
+
+        Args:
+            message: The message containing text and/or image pieces to send.
+
+        Returns:
+            str | list[tuple[str, PromptDataType]]: The response content from Copilot,
+                either as a single text string or a list of (data, data_type) tuples.
+        """
         selectors = self._get_selectors()
 
         # Handle multimodal input - process all pieces in the request
@@ -202,10 +269,20 @@ class PlaywrightCopilotTarget(PromptTarget):
 
         return await self._wait_for_response_async(selectors)
 
-    async def _wait_for_response_async(
-        self, selectors: CopilotSelectors
-    ) -> Union[str, List[Tuple[str, PromptDataType]]]:
-        """Wait for Copilot's response and extract the text and/or images."""
+    async def _wait_for_response_async(self, selectors: CopilotSelectors) -> str | list[tuple[str, PromptDataType]]:
+        """
+        Wait for Copilot's response and extract the text and/or images.
+
+        Args:
+            selectors (CopilotSelectors): The selectors for the Copilot interface.
+
+        Returns:
+            str | list[tuple[str, PromptDataType]]: The response content from Copilot,
+                either as a single text string or a list of (data, data_type) tuples.
+
+        Raises:
+            TimeoutError: If waiting for the AI response times out.
+        """
         # Count current AI messages and message groups before sending
         initial_ai_messages = await self._page.eval_on_selector_all(
             selectors.ai_messages_selector, "elements => elements.length"
@@ -246,7 +323,7 @@ class PlaywrightCopilotTarget(PromptTarget):
 
     async def _extract_content_if_ready_async(
         self, selectors: CopilotSelectors, initial_group_count: int
-    ) -> Union[str, List[Tuple[str, PromptDataType]], None]:
+    ) -> str | list[tuple[str, PromptDataType]] | None:
         """
         Extract content if ready, otherwise return None.
 
@@ -257,7 +334,7 @@ class PlaywrightCopilotTarget(PromptTarget):
             initial_group_count (int): Number of message groups before this response.
 
         Returns:
-            Union[str, List[Tuple[str, PromptDataType]], None]: The extracted content if ready,
+            str | list[tuple[str, PromptDataType]] | None: The extracted content if ready,
                 None if content is not ready yet or extraction fails.
         """
         try:
@@ -281,16 +358,18 @@ class PlaywrightCopilotTarget(PromptTarget):
             if content_ready:
                 logger.debug("Content is ready!")
                 return test_content
-            else:
-                logger.debug("Message exists but content not ready yet, continuing to wait...")
-                return None
+            logger.debug("Message exists but content not ready yet, continuing to wait...")
+            return None
         except Exception as e:
             # Continue waiting if extraction fails
             logger.debug(f"Error checking content readiness: {e}")
             return None
 
-    async def _extract_text_from_message_groups(self, ai_message_groups: list, text_selector: str) -> List[str]:
-        """Extract text content from message groups using the provided selector.
+    async def _extract_text_from_message_groups_async(
+        self, ai_message_groups: list[Any], text_selector: str
+    ) -> list[str]:
+        """
+        Extract text content from message groups using the provided selector.
 
         Args:
             ai_message_groups: List of message group elements to extract text from
@@ -303,7 +382,7 @@ class PlaywrightCopilotTarget(PromptTarget):
 
         for group_idx, msg_group in enumerate(ai_message_groups):
             text_elements = await msg_group.query_selector_all(text_selector)
-            logger.debug(f"Found {len(text_elements)} text elements in group {group_idx+1}")
+            logger.debug(f"Found {len(text_elements)} text elements in group {group_idx + 1}")
 
             for text_elem in text_elements:
                 text = await text_elem.text_content()
@@ -312,8 +391,9 @@ class PlaywrightCopilotTarget(PromptTarget):
 
         return all_text_parts
 
-    def _filter_placeholder_text(self, text_parts: List[str]) -> List[str]:
-        """Filter out placeholder/loading text from extracted content.
+    def _filter_placeholder_text(self, text_parts: list[str]) -> list[str]:
+        """
+        Filter out placeholder/loading text from extracted content.
 
         Args:
             text_parts: List of text strings to filter
@@ -328,8 +408,9 @@ class PlaywrightCopilotTarget(PromptTarget):
         ]
         return [text for text in text_parts if text.lower() not in placeholder_texts]
 
-    async def _count_images_in_groups(self, message_groups: list) -> int:
-        """Count total images in message groups (both iframes and direct).
+    async def _count_images_in_groups_async(self, message_groups: list[Any]) -> int:
+        """
+        Count total images in message groups (both iframes and direct).
 
         Args:
             message_groups: List of message group elements to search
@@ -356,20 +437,22 @@ class PlaywrightCopilotTarget(PromptTarget):
 
         return image_count
 
-    async def _wait_minimum_time(self, seconds: int):
-        """Wait for a minimum amount of time, logging progress.
+    async def _wait_minimum_time_async(self, seconds: int) -> None:
+        """
+        Wait for a minimum amount of time, logging progress.
 
         Args:
             seconds: Number of seconds to wait
         """
         for i in range(seconds):
             await asyncio.sleep(1)
-            logger.debug(f"Minimum wait: {i+1}/{seconds} seconds")
+            logger.debug(f"Minimum wait: {i + 1}/{seconds} seconds")
 
-    async def _wait_for_images_to_stabilize(
-        self, selectors: CopilotSelectors, ai_message_groups: list, initial_group_count: int = 0
-    ) -> list:
-        """Wait for images to appear and DOM to stabilize.
+    async def _wait_for_images_to_stabilize_async(
+        self, selectors: CopilotSelectors, ai_message_groups: list[Any], initial_group_count: int = 0
+    ) -> list[Any]:
+        """
+        Wait for images to appear and DOM to stabilize.
 
         Images may appear 1-5 seconds after text, and the DOM structure can change
         (e.g., from 3 groups to 2 groups). This method waits until either:
@@ -390,7 +473,7 @@ class PlaywrightCopilotTarget(PromptTarget):
         max_wait = self.MAX_IMAGE_WAIT_SECONDS  # But don't wait more than 15 seconds total
 
         # Always wait minimum time first (images often take 2-5 seconds)
-        await self._wait_minimum_time(min_wait)
+        await self._wait_minimum_time_async(min_wait)
 
         # Then check periodically if images have appeared
         last_stable_count = len(ai_message_groups)
@@ -405,7 +488,7 @@ class PlaywrightCopilotTarget(PromptTarget):
             logger.debug(f"After {min_wait + i + 1}s total, new message group count: {current_count}")
 
             # Check for images in both iframes and direct elements
-            image_count = await self._count_images_in_groups(new_groups)
+            image_count = await self._count_images_in_groups_async(new_groups)
 
             if image_count > 0:
                 logger.debug(f"Found {image_count} images after {min_wait + i + 1}s!")
@@ -434,8 +517,9 @@ class PlaywrightCopilotTarget(PromptTarget):
         all_groups = await self._page.query_selector_all(selectors.ai_messages_group_selector)
         return all_groups[initial_group_count:]
 
-    async def _extract_images_from_iframes(self, ai_message_groups: list) -> list:
-        """Extract images from iframes within message groups.
+    async def _extract_images_from_iframes_async(self, ai_message_groups: list[Any]) -> list[Any]:
+        """
+        Extract images from iframes within message groups.
 
         Args:
             ai_message_groups: List of message group elements to search
@@ -447,30 +531,33 @@ class PlaywrightCopilotTarget(PromptTarget):
 
         for group_idx, msg_group in enumerate(ai_message_groups):
             iframes = await msg_group.query_selector_all(self.SELECTOR_IFRAME)
-            logger.debug(f"Found {len(iframes)} iframes in message group {group_idx+1}")
+            logger.debug(f"Found {len(iframes)} iframes in message group {group_idx + 1}")
 
             for idx, iframe_element in enumerate(iframes):
                 try:
                     iframe_id = await iframe_element.get_attribute(self.ATTR_ID)
-                    logger.debug(f"Checking iframe {idx+1} in group {group_idx+1} with id: {iframe_id}")
+                    logger.debug(f"Checking iframe {idx + 1} in group {group_idx + 1} with id: {iframe_id}")
 
                     content_frame = await iframe_element.content_frame()
                     if content_frame:
                         iframe_imgs = await content_frame.query_selector_all(self.ARIA_LABEL_THUMBNAIL)
                         logger.debug(
-                            f"Found {len(iframe_imgs)} thumbnail images in iframe {idx+1} of group {group_idx+1}"
+                            f"Found {len(iframe_imgs)} thumbnail images in iframe {idx + 1} of group {group_idx + 1}"
                         )
                         if iframe_imgs:
                             iframe_images.extend(iframe_imgs)
                     else:
-                        logger.debug(f"Could not access content frame for iframe {idx+1} in group {group_idx+1}")
+                        logger.debug(f"Could not access content frame for iframe {idx + 1} in group {group_idx + 1}")
                 except Exception as e:
-                    logger.debug(f"Error accessing iframe {idx+1} in group {group_idx+1}: {e}")
+                    logger.debug(f"Error accessing iframe {idx + 1} in group {group_idx + 1}: {e}")
 
         return iframe_images
 
-    async def _extract_images_from_message_groups(self, selectors: CopilotSelectors, ai_message_groups: list) -> list:
-        """Extract images directly from message groups (fallback when no iframes).
+    async def _extract_images_from_message_groups_async(
+        self, selectors: CopilotSelectors, ai_message_groups: list[Any]
+    ) -> list[Any]:
+        """
+        Extract images directly from message groups (fallback when no iframes).
 
         Args:
             selectors: The selectors for the Copilot interface
@@ -485,10 +572,10 @@ class PlaywrightCopilotTarget(PromptTarget):
         for idx, msg_group in enumerate(ai_message_groups):
             imgs = await msg_group.query_selector_all(self.ARIA_LABEL_THUMBNAIL)
             if imgs:
-                logger.debug(f"Found {len(imgs)} img elements in message group {idx+1}")
+                logger.debug(f"Found {len(imgs)} img elements in message group {idx + 1}")
                 image_elements.extend(imgs)
             else:
-                logger.debug(f"No imgs with button selector in message group {idx+1}")
+                logger.debug(f"No imgs with button selector in message group {idx + 1}")
 
         logger.debug(f"Total {len(image_elements)} img elements found across all message groups")
 
@@ -500,7 +587,7 @@ class PlaywrightCopilotTarget(PromptTarget):
                 for idx, ai_message in enumerate(all_ai_messages):
                     imgs = await ai_message.query_selector_all(self.ARIA_LABEL_THUMBNAIL)
                     if imgs:
-                        logger.debug(f"Found {len(imgs)} img elements in AI message {idx+1}")
+                        logger.debug(f"Found {len(imgs)} img elements in AI message {idx + 1}")
                         image_elements.extend(imgs)
 
                 logger.debug(f"Total {len(image_elements)} img elements found using M365 button selector")
@@ -510,13 +597,14 @@ class PlaywrightCopilotTarget(PromptTarget):
                     for idx, ai_message in enumerate(all_ai_messages):
                         imgs = await ai_message.query_selector_all(self.SELECTOR_IMAGE)
                         if imgs:
-                            logger.debug(f"Found {len(imgs)} img elements using generic selector in message {idx+1}")
+                            logger.debug(f"Found {len(imgs)} img elements using generic selector in message {idx + 1}")
                             image_elements.extend(imgs)
 
         return image_elements
 
-    async def _process_image_elements(self, image_elements: list) -> List[Tuple[str, PromptDataType]]:
-        """Process image elements and save them to disk.
+    async def _process_image_elements_async(self, image_elements: list[Any]) -> list[tuple[str, PromptDataType]]:
+        """
+        Process image elements and save them to disk.
 
         Args:
             image_elements: List of image elements to process
@@ -524,39 +612,40 @@ class PlaywrightCopilotTarget(PromptTarget):
         Returns:
             List of tuples containing (image_path, "image_path")
         """
-        image_pieces: List[Tuple[str, PromptDataType]] = []
+        image_pieces: list[tuple[str, PromptDataType]] = []
 
         for i, img_elem in enumerate(image_elements):
             src = await img_elem.get_attribute(self.ATTR_SRC)
-            logger.debug(f"Image {i+1} src: {src[:100] if src else None}...")
+            logger.debug(f"Image {i + 1} src: {src[:100] if src else None}...")
 
             if src:
                 try:
                     if src.startswith(self.IMAGE_DATA_URL_PREFIX):
-                        logger.debug(f"Processing data URL image {i+1}")
+                        logger.debug(f"Processing data URL image {i + 1}")
                         # Extract base64 data from data URL
                         header, data = src.split(",", 1)
 
                         # Save the image using data serializer
                         serializer = data_serializer_factory(category="prompt-memory-entries", data_type="image_path")
-                        await serializer.save_b64_image(data=data)
+                        await serializer.save_b64_image_async(data=data)
                         image_path = serializer.value
                         logger.debug(f"Saved image to: {image_path}")
                         image_pieces.append((image_path, "image_path"))
                     else:
-                        logger.debug(f"Image {i+1} is not a data URL, starts with: {src[:20]}")
+                        logger.debug(f"Image {i + 1} is not a data URL, starts with: {src[:20]}")
                 except Exception as e:
-                    logger.warning(f"Failed to extract image {i+1}: {e}")
+                    logger.warning(f"Failed to extract image {i + 1}: {e}")
                     continue
             else:
-                logger.debug(f"Image {i+1} has no src attribute")
+                logger.debug(f"Image {i + 1} has no src attribute")
 
         return image_pieces
 
     async def _extract_and_filter_text_async(
-        self, *, ai_message_groups: list, text_selector: str
-    ) -> List[Tuple[str, PromptDataType]]:
-        """Extract and filter text content from message groups.
+        self, *, ai_message_groups: list[Any], text_selector: str
+    ) -> list[tuple[str, PromptDataType]]:
+        """
+        Extract and filter text content from message groups.
 
         Args:
             ai_message_groups: Message groups to process
@@ -565,12 +654,12 @@ class PlaywrightCopilotTarget(PromptTarget):
         Returns:
             List of text response pieces (empty if no valid text found)
         """
-        all_text_parts = await self._extract_text_from_message_groups(ai_message_groups, text_selector)
+        all_text_parts = await self._extract_text_from_message_groups_async(ai_message_groups, text_selector)
         logger.debug(f"Extracted text parts from all groups: {all_text_parts}")
 
         filtered_text_parts = self._filter_placeholder_text(all_text_parts)
 
-        response_pieces: List[Tuple[str, PromptDataType]] = []
+        response_pieces: list[tuple[str, PromptDataType]] = []
         if filtered_text_parts:
             text_content = "\n".join(filtered_text_parts).strip()
             if text_content:
@@ -582,9 +671,10 @@ class PlaywrightCopilotTarget(PromptTarget):
         return response_pieces
 
     async def _extract_all_images_async(
-        self, *, selectors: CopilotSelectors, ai_message_groups: list, initial_group_count: int
-    ) -> List[Tuple[str, PromptDataType]]:
-        """Extract all images from message groups using iframe and direct methods.
+        self, *, selectors: CopilotSelectors, ai_message_groups: list[Any], initial_group_count: int
+    ) -> list[tuple[str, PromptDataType]]:
+        """
+        Extract all images from message groups using iframe and direct methods.
 
         Args:
             selectors: Copilot interface selectors
@@ -595,24 +685,27 @@ class PlaywrightCopilotTarget(PromptTarget):
             List of image response pieces
         """
         # Wait for images to appear and DOM to stabilize
-        updated_groups = await self._wait_for_images_to_stabilize(selectors, ai_message_groups, initial_group_count)
+        updated_groups = await self._wait_for_images_to_stabilize_async(
+            selectors, ai_message_groups, initial_group_count
+        )
         logger.debug(f"Final new message group count for image search: {len(updated_groups)}")
 
         # Try to extract images from iframes first (M365 uses iframes)
-        iframe_images = await self._extract_images_from_iframes(updated_groups)
+        iframe_images = await self._extract_images_from_iframes_async(updated_groups)
 
         if iframe_images:
             logger.debug(f"Total {len(iframe_images)} images found in iframes within message groups!")
             image_elements = iframe_images
         else:
             logger.debug("No images found in iframes, searching message groups directly")
-            image_elements = await self._extract_images_from_message_groups(selectors, updated_groups)
+            image_elements = await self._extract_images_from_message_groups_async(selectors, updated_groups)
 
         # Process and save images
-        return await self._process_image_elements(image_elements)
+        return await self._process_image_elements_async(image_elements)
 
-    async def _extract_fallback_text_async(self, *, ai_message_groups: list) -> str:
-        """Extract fallback text content when no other content is found.
+    async def _extract_fallback_text_async(self, *, ai_message_groups: list[Any]) -> str:
+        """
+        Extract fallback text content when no other content is found.
 
         Args:
             ai_message_groups: Message groups to extract from
@@ -630,9 +723,10 @@ class PlaywrightCopilotTarget(PromptTarget):
         return fallback_result
 
     def _assemble_response(
-        self, *, response_pieces: List[Tuple[str, PromptDataType]]
-    ) -> Union[str, List[Tuple[str, PromptDataType]]]:
-        """Assemble response pieces into appropriate return format.
+        self, *, response_pieces: list[tuple[str, PromptDataType]]
+    ) -> str | list[tuple[str, PromptDataType]]:
+        """
+        Assemble response pieces into appropriate return format.
 
         Args:
             response_pieces: List of (content, data_type) tuples
@@ -644,17 +738,17 @@ class PlaywrightCopilotTarget(PromptTarget):
             # Single text response - maintain backward compatibility
             logger.debug(f"Returning single text response: '{response_pieces[0][0]}'")
             return response_pieces[0][0]
-        elif response_pieces:
+        if response_pieces:
             # Multimodal or multiple pieces
             logger.debug(f"Returning {len(response_pieces)} response pieces")
             return response_pieces
-        else:
-            return ""
+        return ""
 
     async def _extract_multimodal_content_async(
         self, selectors: CopilotSelectors, initial_group_count: int = 0
-    ) -> Union[str, List[Tuple[str, PromptDataType]]]:
-        """Extract multimodal content (text and images) from Copilot response.
+    ) -> str | list[tuple[str, PromptDataType]]:
+        """
+        Extract multimodal content (text and images) from Copilot response.
 
         Args:
             selectors: The selectors for the Copilot interface
@@ -690,17 +784,27 @@ class PlaywrightCopilotTarget(PromptTarget):
         # Return appropriate format, with fallback if needed
         if response_pieces:
             return self._assemble_response(response_pieces=response_pieces)
-        else:
-            return await self._extract_fallback_text_async(ai_message_groups=ai_message_groups)
+        return await self._extract_fallback_text_async(ai_message_groups=ai_message_groups)
 
     async def _send_text_async(self, *, text: str, input_selector: str) -> None:
-        """Send text input to Copilot interface."""
+        """
+        Send text input to Copilot interface.
+
+        Args:
+            text: The text to send.
+            input_selector: The CSS selector for the input field.
+        """
         # For M365 Copilot's contenteditable span, use type() instead of fill()
         await self._page.locator(input_selector).click()  # Focus first
         await self._page.locator(input_selector).type(text)
 
     async def _upload_image_async(self, image_path: str) -> None:
-        """Handle image upload through Copilot's dropdown interface."""
+        """
+        Handle image upload through Copilot's dropdown interface.
+
+        Args:
+            image_path: The file path of the image to upload.
+        """
         selectors = self._get_selectors()
 
         # First, click the button to open the dropdown with retry logic
@@ -720,14 +824,20 @@ class PlaywrightCopilotTarget(PromptTarget):
         await self._check_login_requirement_async()
 
     async def _click_dropdown_button_async(self, selector: str) -> None:
-        """Click the dropdown button with retry logic."""
+        """
+        Click the dropdown button with retry logic.
+
+        Args:
+            selector: The CSS selector for the dropdown button.
+
+        Raises:
+            RuntimeError: If the button cannot be found or clicked.
+        """
         add_content_button = self._page.locator(selector)
 
         # First, wait for the button to potentially appear
-        try:
+        with suppress(Exception):
             await add_content_button.wait_for(state="attached", timeout=3000)
-        except Exception:
-            pass  # Continue with retry logic if wait fails
 
         # Retry mechanism: check button count up to 5 times with 500ms delays
         button_found = False
@@ -756,23 +866,14 @@ class PlaywrightCopilotTarget(PromptTarget):
         await add_content_button.click()
 
     async def _check_login_requirement_async(self) -> None:
-        """Check if login is required for Consumer Copilot features."""
+        """
+        Check if login is required for Consumer Copilot features.
+
+        Raises:
+            RuntimeError: If login is required to access advanced features.
+        """
         # In Consumer Copilot we can't submit pictures which will surface by prompting for login
         sign_in_header_count = await self._page.locator(f'h1:has-text("{self.LOGIN_REQUIRED_HEADER}")').count()
         sign_in_header_present = sign_in_header_count > 0
         if sign_in_header_present:
             raise RuntimeError("Login required to access advanced features in Consumer Copilot.")
-
-    def _validate_request(self, *, message: Message) -> None:
-        """Validate that the message is compatible with Copilot."""
-        if not message.message_pieces:
-            raise ValueError("This target requires at least one message piece.")
-
-        # Validate that all pieces are supported types
-        for i, piece in enumerate(message.message_pieces):
-            piece_type = piece.converted_value_data_type
-            if piece_type not in self.SUPPORTED_DATA_TYPES:
-                supported_types = ", ".join(self.SUPPORTED_DATA_TYPES)
-                raise ValueError(
-                    f"This target only supports {supported_types} prompt input. " f"Piece {i} has type: {piece_type}."
-                )

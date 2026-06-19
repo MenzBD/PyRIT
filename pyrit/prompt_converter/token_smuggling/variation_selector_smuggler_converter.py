@@ -2,8 +2,9 @@
 # Licensed under the MIT license.
 
 import logging
-from typing import Literal, Optional, Tuple
+from typing import Literal
 
+from pyrit.models import ComponentIdentifier
 from pyrit.prompt_converter.token_smuggling.base import SmugglerConverter
 
 logger = logging.getLogger(__name__)
@@ -28,18 +29,22 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
     visible and hidden content within a single string.
     """
 
+    # Grandfathered: ``action`` is inherited from SmugglerConverter's public API.
+    # TODO: remove this opt-out and insert ``*,`` after ``self`` in 0.16.0.
+    _brick_legacy_init = True
+
     def __init__(
         self,
         action: Literal["encode", "decode"] = "encode",
-        base_char_utf8: Optional[str] = None,
+        base_char_utf8: str | None = None,
         embed_in_base: bool = True,
-    ):
+    ) -> None:
         """
-        Initializes the converter with options for encoding/decoding.
+        Initialize the converter with options for encoding/decoding.
 
         Args:
             action (Literal["encode", "decode"]): The action to perform.
-            base_char_utf8 (Optional[str]): Base character for ``variation_selector_smuggler`` mode (default: 😊).
+            base_char_utf8 (str | None): Base character for ``variation_selector_smuggler`` mode (default: 😊).
             embed_in_base (bool): If True, the hidden payload is embedded directly into the base character.
                                     If False, a visible separator (space) is inserted between the base and payload.
                                     Default is True.
@@ -51,9 +56,24 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
         self.utf8_base_char = base_char_utf8 if base_char_utf8 is not None else "😊"
         self.embed_in_base = embed_in_base
 
-    def encode_message(self, message: str) -> Tuple[str, str]:
+    def _build_identifier(self) -> ComponentIdentifier:
         """
-        Encodes the message using Unicode variation selectors.
+        Build identifier with variation selector parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this converter.
+        """
+        return self._create_identifier(
+            params={
+                "action": self.action,
+                "base_char": self.utf8_base_char,
+                "embed_in_base": self.embed_in_base,
+            }
+        )
+
+    def encode_message(self, message: str) -> tuple[str, str]:
+        """
+        Encode the message using Unicode variation selectors.
 
         The message is converted to UTF-8 bytes, and each byte is mapped to a variation selector:
             - 0x00-0x0F => U+FE00 to U+FE0F.
@@ -61,19 +81,19 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
 
         If ``embed_in_base`` is True, the payload is embedded directly into the base character;
         otherwise, a visible separator (a space) is inserted between the base and payload.
+
+        Args:
+            message (str): The message to encode.
+
+        Returns:
+            tuple[str, str]: A tuple containing a summary of the code points and the encoded string.
         """
         payload = ""
         data = message.encode("utf-8")
         for byte in data:
-            if byte < 16:
-                code_point = 0xFE00 + byte
-            else:
-                code_point = 0xE0100 + (byte - 16)
+            code_point = 65024 + byte if byte < 16 else 917760 + (byte - 16)
             payload += chr(code_point)
-        if self.embed_in_base:
-            encoded = self.utf8_base_char + payload
-        else:
-            encoded = self.utf8_base_char + " " + payload
+        encoded = self.utf8_base_char + payload if self.embed_in_base else self.utf8_base_char + " " + payload
         summary_parts = [f"Base char: U+{ord(self.utf8_base_char):X}"]
         for byte in data:
             if byte < 16:
@@ -86,8 +106,14 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
 
     def decode_message(self, message: str) -> str:
         """
-        Decodes a message encoded using Unicode variation selectors.
+        Decode a message encoded using Unicode variation selectors.
         The decoder scans the string for variation selectors, ignoring any visible separator.
+
+        Args:
+            message (str): The encoded message.
+
+        Returns:
+            str: The decoded message.
         """
         bytes_out = bytearray()
         started = False
@@ -116,9 +142,9 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
         return decoded_text
 
     # Extension of Paul Butler's method
-    def encode_visible_hidden(self, visible: str, hidden: str) -> Tuple[str, str]:
+    def encode_visible_hidden(self, visible: str, hidden: str) -> tuple[str, str]:
         """
-        Combines visible text with hidden text by encoding the hidden text using ``variation_selector_smuggler`` mode.
+        Combine visible text with hidden text by encoding the hidden text using ``variation_selector_smuggler`` mode.
 
         The hidden payload is generated as a composite using the current embedding setting and then appended
         to the visible text.
@@ -128,16 +154,16 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
             hidden (str): The secret/hidden text to encode.
 
         Returns:
-            Tuple[str, str]: A tuple containing a summary and the combined text.
+            tuple[str, str]: A tuple containing a summary and the combined text.
         """
         summary, encoded_hidden = self.encode_message(hidden)
         combined = visible + encoded_hidden
         return summary, combined
 
     # Extension of Paul Butler's method
-    def decode_visible_hidden(self, combined: str) -> Tuple[str, str]:
+    def decode_visible_hidden(self, combined: str) -> tuple[str, str]:
         """
-        Extracts the visible text and decodes the hidden text from a combined string.
+        Extract the visible text and decodes the hidden text from a combined string.
 
         It searches for the first occurrence of the base character (``self.utf8_base_char``) and treats everything
         from that point on as the hidden payload.
@@ -146,7 +172,7 @@ class VariationSelectorSmugglerConverter(SmugglerConverter):
             combined (str): The combined text containing visible and hidden parts.
 
         Returns:
-            Tuple[str, str]: A tuple with the visible text and the decoded hidden text.
+            tuple[str, str]: A tuple with the visible text and the decoded hidden text.
         """
         base_char = self.utf8_base_char
         index = combined.find(base_char)

@@ -2,8 +2,9 @@
 # Licensed under the MIT license.
 
 import logging
-from typing import Literal, Optional, Tuple
+from typing import Literal
 
+from pyrit.models import ComponentIdentifier
 from pyrit.prompt_converter.token_smuggling.base import SmugglerConverter
 
 logger = logging.getLogger(__name__)
@@ -18,22 +19,26 @@ class SneakyBitsSmugglerConverter(SmugglerConverter):
         - ``one_char`` (default: U+2064) to represent binary 1.
 
     Replicates functionality detailed in:
-        - https://embracethered.com/blog/posts/2025/sneaky-bits-and-ascii-smuggler/
+        - [@embracethered2025sneakybits]
     """
+
+    # Grandfathered: ``action`` is inherited from SmugglerConverter's public API.
+    # TODO: remove this opt-out and insert ``*,`` after ``self`` in 0.16.0.
+    _brick_legacy_init = True
 
     def __init__(
         self,
         action: Literal["encode", "decode"] = "encode",
-        zero_char: Optional[str] = None,
-        one_char: Optional[str] = None,
-    ):
+        zero_char: str | None = None,
+        one_char: str | None = None,
+    ) -> None:
         """
-        Initializes the converter with options for encoding/decoding in Sneaky Bits mode.
+        Initialize the converter with options for encoding/decoding in Sneaky Bits mode.
 
         Args:
             action (Literal["encode", "decode"]): The action to perform.
-            zero_char (Optional[str]): Character to represent binary 0 in ``sneaky_bits`` mode (default: U+2062).
-            one_char (Optional[str]): Character to represent binary 1 in ``sneaky_bits`` mode (default: U+2064).
+            zero_char (str | None): Character to represent binary 0 in ``sneaky_bits`` mode (default: U+2062).
+            one_char (str | None): Character to represent binary 1 in ``sneaky_bits`` mode (default: U+2064).
 
         Raises:
             ValueError: If an unsupported action or ``encoding_mode`` is provided.
@@ -42,9 +47,24 @@ class SneakyBitsSmugglerConverter(SmugglerConverter):
         self.zero_char = zero_char if zero_char is not None else "\u2062"  # Invisible Times
         self.one_char = one_char if one_char is not None else "\u2064"  # Invisible Plus
 
-    def encode_message(self, message: str) -> Tuple[str, str]:
+    def _build_identifier(self) -> ComponentIdentifier:
         """
-        Encodes the message using Sneaky Bits mode.
+        Build identifier with sneaky bits parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this converter.
+        """
+        return self._create_identifier(
+            params={
+                "action": self.action,
+                "zero_char_codepoint": hex(ord(self.zero_char)),
+                "one_char_codepoint": hex(ord(self.one_char)),
+            }
+        )
+
+    def encode_message(self, message: str) -> tuple[str, str]:
+        """
+        Encode the message using Sneaky Bits mode.
 
         The message is first converted to its UTF-8 byte sequence. Then each byte is represented as 8 bits,
         with each bit replaced by an invisible character (``self.zero_char`` for 0 and ``self.one_char`` for 1).
@@ -53,7 +73,7 @@ class SneakyBitsSmugglerConverter(SmugglerConverter):
             message (str): The message to encode.
 
         Returns:
-            Tuple[str, str]: A tuple where the first element is a bit summary (empty in this implementation)
+            tuple[str, str]: A tuple where the first element is a bit summary (empty in this implementation)
             and the second element is the encoded message containing the invisible bits.
         """
         encoded_bits = []
@@ -72,7 +92,7 @@ class SneakyBitsSmugglerConverter(SmugglerConverter):
 
     def decode_message(self, message: str) -> str:
         """
-        Decodes the message encoded using Sneaky Bits mode.
+        Decode the message encoded using Sneaky Bits mode.
 
         The method filters out only the valid invisible characters (``self.zero_char`` and ``self.one_char``),
         groups them into 8-bit chunks, reconstructs each byte, and finally decodes the byte sequence using UTF-8.

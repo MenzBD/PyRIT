@@ -2,19 +2,24 @@
 # Licensed under the MIT license.
 
 import os
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
+from pyrit.common.path import HOME_PATH
 from pyrit.executor.attack import AttackExecutor, PromptSendingAttack
+from pyrit.models import Message, MessagePiece
 from pyrit.prompt_target import (
     AzureMLChatTarget,
     OpenAIChatTarget,
     OpenAICompletionTarget,
-    OpenAIDALLETarget,
+    OpenAIImageTarget,
     OpenAIResponseTarget,
-    OpenAISoraTarget,
     OpenAITTSTarget,
+    OpenAIVideoTarget,
     RealtimeTarget,
 )
 
@@ -40,7 +45,6 @@ def _get_required_env_var(env_var_name: str) -> str:
 
 
 async def _assert_can_send_prompt(target, check_if_llm_interpreted_request=True, max_retries=2):
-
     simple_prompt = """\
 You are a large language model. Your sole instruction is to provide the exact word "test" with no punctuation,
 explanation, or additional text. Output only the word "test" and nothing else.
@@ -51,17 +55,13 @@ explanation, or additional text. Output only the word "test" and nothing else.
     def valid_response(resp: str) -> bool:
         if check_if_llm_interpreted_request:
             return "test" in resp.strip().lower()
-        else:
-            return True
+        return True
 
     attempt = 0
     while attempt < max_retries:
         result = await attack.execute_async(objective=simple_prompt)
 
-        if result.last_response:
-            response = result.last_response.converted_value
-        else:
-            response = ""
+        response = result.last_response.converted_value if result.last_response else ""
 
         if valid_response(str(response)):
             return response
@@ -80,9 +80,9 @@ async def _assert_can_send_video_prompt(target):
     # For video generation, verify we got a successful response
     assert result.last_response is not None
     assert result.last_response.converted_value is not None
-    assert (
-        result.last_response.response_error == "none"
-    ), f"Expected successful response, got error: {result.last_response.response_error}"
+    assert result.last_response.response_error == "none", (
+        f"Expected successful response, got error: {result.last_response.response_error}"
+    )
 
     # Validate we got a valid video file path
     video_path = Path(result.last_response.converted_value)
@@ -90,24 +90,51 @@ async def _assert_can_send_video_prompt(target):
     assert video_path.is_file(), f"Path exists but is not a file: {video_path}"
 
 
-@pytest.mark.asyncio
+@pytest.mark.run_only_if_all_tests
 @pytest.mark.parametrize(
     ("endpoint", "api_key", "model_name", "supports_seed"),
     [
         ("OPENAI_CHAT_ENDPOINT", "OPENAI_CHAT_KEY", "OPENAI_CHAT_MODEL", True),
         ("PLATFORM_OPENAI_CHAT_ENDPOINT", "PLATFORM_OPENAI_CHAT_KEY", "PLATFORM_OPENAI_CHAT_MODEL", True),
-        ("AZURE_OPENAI_GPT4O_ENDPOINT", "AZURE_OPENAI_GPT4O_KEY", "", True),
-        ("AZURE_OPENAI_INTEGRATION_TEST_ENDPOINT", "AZURE_OPENAI_INTEGRATION_TEST_KEY", "", True),
-        ("AZURE_OPENAI_GPT4O_UNSAFE_ENDPOINT", "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_KEY", "", True),
-        ("AZURE_OPENAI_GPT4O_UNSAFE_CHAT_ENDPOINT2", "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_KEY2", "", True),
-        ("AZURE_OPENAI_GPT3_5_CHAT_ENDPOINT", "AZURE_OPENAI_GPT3_5_CHAT_KEY", "", True),
-        ("AZURE_OPENAI_GPT4_CHAT_ENDPOINT", "AZURE_OPENAI_GPT4_CHAT_KEY", "", True),
-        ("AZURE_OPENAI_GPTV_CHAT_ENDPOINT", "AZURE_OPENAI_GPTV_CHAT_KEY", "", True),
-        ("AZURE_FOUNDRY_DEEPSEEK_ENDPOINT", "AZURE_FOUNDRY_DEEPSEEK_KEY", "", True),
-        ("AZURE_FOUNDRY_PHI4_ENDPOINT", "AZURE_CHAT_PHI4_KEY", "", True),
-        ("AZURE_FOUNDRY_MINSTRAL3B_ENDPOINT", "AZURE_CHAT_MINSTRAL3B_KEY", "", False),
+        ("AZURE_OPENAI_GPT4O_ENDPOINT", "AZURE_OPENAI_GPT4O_KEY", "AZURE_OPENAI_GPT4O_MODEL", True),
+        (
+            "AZURE_OPENAI_INTEGRATION_TEST_ENDPOINT",
+            "AZURE_OPENAI_INTEGRATION_TEST_KEY",
+            "AZURE_OPENAI_INTEGRATION_TEST_MODEL",
+            True,
+        ),
+        (
+            "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_ENDPOINT",
+            "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_KEY",
+            "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_MODEL",
+            True,
+        ),
+        (
+            "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_ENDPOINT2",
+            "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_KEY2",
+            "AZURE_OPENAI_GPT4O_UNSAFE_CHAT_MODEL2",
+            True,
+        ),
+        ("AZURE_OPENAI_GPT3_5_CHAT_ENDPOINT", "AZURE_OPENAI_GPT3_5_CHAT_KEY", "AZURE_OPENAI_GPT3_5_CHAT_MODEL", True),
+        ("AZURE_OPENAI_GPT4_CHAT_ENDPOINT", "AZURE_OPENAI_GPT4_CHAT_KEY", "AZURE_OPENAI_GPT4_CHAT_MODEL", True),
+        ("AZURE_OPENAI_GPTV_CHAT_ENDPOINT", "AZURE_OPENAI_GPTV_CHAT_KEY", "AZURE_OPENAI_GPTV_CHAT_MODEL", True),
+        (
+            "AZURE_OPENAI_GPT5_COMPLETIONS_ENDPOINT",
+            "AZURE_OPENAI_GPT5_COMPLETIONS_KEY",
+            "AZURE_OPENAI_GPT5_COMPLETIONS_MODEL",
+            True,
+        ),
+        ("AZURE_FOUNDRY_DEEPSEEK_ENDPOINT", "AZURE_FOUNDRY_DEEPSEEK_KEY", "AZURE_FOUNDRY_DEEPSEEK_MODEL", True),
+        (
+            "AZURE_FOUNDRY_MISTRAL_LARGE_ENDPOINT",
+            "AZURE_FOUNDRY_MISTRAL_LARGE_KEY",
+            "AZURE_FOUNDRY_MISTRAL_LARGE_MODEL",
+            False,
+        ),
+        ("AZURE_FOUNDRY_PHI4_ENDPOINT", "AZURE_CHAT_PHI4_KEY", "AZURE_CHAT_PHI4_MODEL", True),
         ("GOOGLE_GEMINI_ENDPOINT", "GOOGLE_GEMINI_API_KEY", "GOOGLE_GEMINI_MODEL", False),
         ("ANTHROPIC_CHAT_ENDPOINT", "ANTHROPIC_CHAT_KEY", "ANTHROPIC_CHAT_MODEL", False),
+        ("AWS_ENDPOINT", "AWS_KEY", "AWS_CHAT_MODEL", False),
     ],
 )
 async def test_connect_required_openai_text_targets(sqlite_instance, endpoint, api_key, model_name, supports_seed):
@@ -130,7 +157,7 @@ async def test_connect_required_openai_text_targets(sqlite_instance, endpoint, a
     await _assert_can_send_prompt(target)
 
 
-@pytest.mark.asyncio
+@pytest.mark.run_only_if_all_tests
 @pytest.mark.parametrize(
     ("endpoint", "api_key", "model_name"),
     [
@@ -140,6 +167,17 @@ async def test_connect_required_openai_text_targets(sqlite_instance, endpoint, a
             "PLATFORM_OPENAI_RESPONSES_MODEL",
         ),
         ("AZURE_OPENAI_RESPONSES_ENDPOINT", "AZURE_OPENAI_RESPONSES_KEY", "AZURE_OPENAI_RESPONSES_MODEL"),
+        (
+            "AZURE_OPENAI_GPT41_RESPONSES_ENDPOINT",
+            "AZURE_OPENAI_GPT41_RESPONSES_KEY",
+            "AZURE_OPENAI_GPT41_RESPONSES_MODEL",
+        ),
+        (
+            "AZURE_OPENAI_GPT5_RESPONSES_ENDPOINT",
+            "AZURE_OPENAI_GPT5_KEY",
+            "AZURE_OPENAI_GPT5_MODEL",
+        ),
+        ("AWS_ENDPOINT", "AWS_KEY", "AWS_RESPONSES_MODEL"),
     ],
 )
 async def test_connect_required_openai_response_targets(sqlite_instance, endpoint, api_key, model_name):
@@ -158,11 +196,12 @@ async def test_connect_required_openai_response_targets(sqlite_instance, endpoin
     await _assert_can_send_prompt(target, check_if_llm_interpreted_request=False)
 
 
-@pytest.mark.asyncio
+@pytest.mark.run_only_if_all_tests
 @pytest.mark.parametrize(
     ("endpoint", "api_key", "model_name"),
     [
-        ("AZURE_OPENAI_REALTIME_ENDPOINT", "AZURE_OPENAI_REALTIME_API_KEY", "AZURE_OPENAI_REALTIME_MODEL"),
+        ("OPENAI_REALTIME_ENDPOINT", "OPENAI_REALTIME_API_KEY", "OPENAI_REALTIME_MODEL"),
+        ("PLATFORM_OPENAI_REALTIME_ENDPOINT", "PLATFORM_OPENAI_REALTIME_KEY", "PLATFORM_OPENAI_REALTIME_MODEL"),
     ],
 )
 async def test_connect_required_realtime_targets(sqlite_instance, endpoint, api_key, model_name):
@@ -179,12 +218,50 @@ async def test_connect_required_realtime_targets(sqlite_instance, endpoint, api_
     await _assert_can_send_prompt(target)
 
 
-@pytest.mark.asyncio
+@pytest.mark.run_only_if_all_tests
+@pytest.mark.parametrize(
+    ("endpoint", "api_key", "model_name"),
+    [
+        ("AZURE_OPENAI_REALTIME_ENDPOINT", "AZURE_OPENAI_REALTIME_API_KEY", "AZURE_OPENAI_REALTIME_MODEL"),
+    ],
+)
+async def test_realtime_target_multi_objective(sqlite_instance, endpoint, api_key, model_name):
+    """Test RealtimeTarget with multiple objectives like the notebook does."""
+    endpoint_value = _get_required_env_var(endpoint)
+    api_key_value = _get_required_env_var(api_key)
+    model_name_value = _get_required_env_var(model_name)
+
+    target = RealtimeTarget(
+        endpoint=endpoint_value,
+        api_key=api_key_value,
+        model_name=model_name_value,
+    )
+
+    prompt_to_send = "What is the capitol of France?"
+    second_prompt_to_send = "What is the size of that city?"
+
+    attack = PromptSendingAttack(objective_target=target)
+    results = await AttackExecutor().execute_attack_async(
+        attack=attack,
+        objectives=[prompt_to_send, second_prompt_to_send],
+    )
+
+    # Verify we got results for both objectives
+    assert results is not None
+    assert len(results.completed_results) == 2
+
+    # Verify both responses have content
+    for result in results.completed_results:
+        assert result.last_response is not None
+        assert result.last_response.converted_value
+        assert len(result.last_response.converted_value) > 0
+
+
 @pytest.mark.parametrize(
     ("endpoint", "api_key"),
     [
         ("AZURE_ML_MANAGED_ENDPOINT", "AZURE_ML_KEY"),
-        ("AZURE_ML_MIXTRAL_ENDPOINT", "AZURE_ML_MIXTRAL_KEY"),
+        ("AZURE_ML_PHI_ENDPOINT", "AZURE_ML_PHI_KEY"),
     ],
 )
 async def test_connect_required_aml_text_targets(sqlite_instance, endpoint, api_key):
@@ -199,7 +276,6 @@ async def test_connect_required_aml_text_targets(sqlite_instance, endpoint, api_
     await _assert_can_send_prompt(target)
 
 
-@pytest.mark.asyncio
 async def test_connect_openai_completion(sqlite_instance):
     endpoint_value = _get_required_env_var("OPENAI_COMPLETION_ENDPOINT")
     api_key_value = _get_required_env_var("OPENAI_COMPLETION_API_KEY")
@@ -214,63 +290,187 @@ async def test_connect_openai_completion(sqlite_instance):
     await _assert_can_send_prompt(target, check_if_llm_interpreted_request=False)
 
 
-@pytest.mark.asyncio
+@pytest.mark.run_only_if_all_tests
 @pytest.mark.parametrize(
-    ("endpoint", "api_key"),
+    ("endpoint", "api_key", "model_name"),
     [
-        ("OPENAI_DALLE_ENDPOINT1", "OPENAI_DALLE_API_KEY1"),
-        ("OPENAI_DALLE_ENDPOINT2", "OPENAI_DALLE_API_KEY2"),
+        ("OPENAI_IMAGE_ENDPOINT1", "OPENAI_IMAGE_API_KEY1", "OPENAI_IMAGE_MODEL1"),  # gpt-image-1.5
+        ("OPENAI_IMAGE_ENDPOINT2", "OPENAI_IMAGE_API_KEY2", "OPENAI_IMAGE_MODEL2"),  # gpt-image-1
+        ("PLATFORM_OPENAI_IMAGE_ENDPOINT", "PLATFORM_OPENAI_IMAGE_KEY", "PLATFORM_OPENAI_IMAGE_MODEL"),  # gpt-image-1.5
     ],
 )
-async def test_connect_dall_e(sqlite_instance, endpoint, api_key):
+async def test_connect_image(sqlite_instance, endpoint, api_key, model_name):
     endpoint_value = _get_required_env_var(endpoint)
     api_key_value = _get_required_env_var(api_key)
+    model_name_value = os.getenv(model_name) if model_name else ""
 
-    target = OpenAIDALLETarget(
+    target = OpenAIImageTarget(
         endpoint=endpoint_value,
         api_key=api_key_value,
+        model_name=model_name_value,
     )
 
-    await _assert_can_send_prompt(target, check_if_llm_interpreted_request=False)
+    image_prompt = "A simple test image of a raccoon"
+    attack = PromptSendingAttack(objective_target=target)
+    result = await attack.execute_async(objective=image_prompt)
+
+    # For image generation, verify we got a successful response
+    assert result.last_response is not None
+    assert result.last_response.converted_value is not None
+    assert result.last_response.response_error == "none", (
+        f"Expected successful response, got error: {result.last_response.response_error}"
+    )
+
+    # Validate we got a valid image file path
+    image_path = Path(result.last_response.converted_value)
+    assert image_path.exists(), f"Image file not found at path: {image_path}"
+    assert image_path.is_file(), f"Path exists but is not a file: {image_path}"
 
 
-@pytest.mark.asyncio
+# Path to sample image file for image editing tests
+SAMPLE_IMAGE_FILE = HOME_PATH / "assets" / "pyrit_architecture.png"
+
+
+@pytest.mark.run_only_if_all_tests
+async def test_image_editing_single_image_api_key(sqlite_instance):
+    """
+    Test image editing with a single image input using API key authentication.
+    Uses gpt-image-1 which supports image editing/remix.
+
+    Verifies that:
+    1. A text prompt + single image generates a modified image
+    2. The edit endpoint is correctly called
+    3. The output image file is created
+    """
+    endpoint_value = _get_required_env_var("OPENAI_IMAGE_ENDPOINT2")
+    api_key_value = _get_required_env_var("OPENAI_IMAGE_API_KEY2")
+    model_name_value = os.getenv("OPENAI_IMAGE_MODEL2") or "gpt-image-1"
+
+    target = OpenAIImageTarget(
+        endpoint=endpoint_value,
+        api_key=api_key_value,
+        model_name=model_name_value,
+    )
+
+    conv_id = str(uuid.uuid4())
+    text_piece = MessagePiece(
+        role="user",
+        original_value="Add a red border around this image",
+        original_value_data_type="text",
+        conversation_id=conv_id,
+    )
+    image_piece = MessagePiece(
+        role="user",
+        original_value=str(SAMPLE_IMAGE_FILE),
+        original_value_data_type="image_path",
+        conversation_id=conv_id,
+    )
+
+    message = Message(message_pieces=[text_piece, image_piece])
+    result = await target.send_prompt_async(message=message)
+
+    assert result is not None
+    assert len(result) >= 1
+    assert result[0].message_pieces[0].response_error == "none"
+
+    # Validate we got a valid image file path
+    output_path = Path(result[0].message_pieces[0].converted_value)
+    assert output_path.exists(), f"Output image file not found at path: {output_path}"
+    assert output_path.is_file(), f"Path exists but is not a file: {output_path}"
+
+
+@pytest.mark.run_only_if_all_tests
+async def test_image_editing_multiple_images_api_key(sqlite_instance):
+    """
+    Test image editing with multiple image inputs using API key authentication.
+    Uses gpt-image-1 which supports 1-16 image inputs.
+
+    Verifies that:
+    1. Multiple images can be passed to the edit endpoint
+    2. The model processes multiple image inputs correctly
+    """
+    endpoint_value = _get_required_env_var("OPENAI_IMAGE_ENDPOINT2")
+    api_key_value = _get_required_env_var("OPENAI_IMAGE_API_KEY2")
+    model_name_value = os.getenv("OPENAI_IMAGE_MODEL2") or "gpt-image-1"
+
+    target = OpenAIImageTarget(
+        endpoint=endpoint_value,
+        api_key=api_key_value,
+        model_name=model_name_value,
+    )
+
+    conv_id = str(uuid.uuid4())
+    text_piece = MessagePiece(
+        role="user",
+        original_value="Combine these images into one",
+        original_value_data_type="text",
+        conversation_id=conv_id,
+    )
+    image_piece1 = MessagePiece(
+        role="user",
+        original_value=str(SAMPLE_IMAGE_FILE),
+        original_value_data_type="image_path",
+        conversation_id=conv_id,
+    )
+    image_piece2 = MessagePiece(
+        role="user",
+        original_value=str(SAMPLE_IMAGE_FILE),
+        original_value_data_type="image_path",
+        conversation_id=conv_id,
+    )
+
+    message = Message(message_pieces=[text_piece, image_piece1, image_piece2])
+    result = await target.send_prompt_async(message=message)
+
+    assert result is not None
+    assert len(result) >= 1
+    assert result[0].message_pieces[0].response_error == "none"
+
+    # Validate we got a valid image file path
+    output_path = Path(result[0].message_pieces[0].converted_value)
+    assert output_path.exists(), f"Output image file not found at path: {output_path}"
+    assert output_path.is_file(), f"Path exists but is not a file: {output_path}"
+
+
+@pytest.mark.run_only_if_all_tests
 @pytest.mark.parametrize(
-    ("endpoint", "api_key"),
+    ("endpoint", "api_key", "model_name"),
     [
-        ("OPENAI_TTS_ENDPOINT1", "OPENAI_TTS_KEY1"),
-        ("OPENAI_TTS_ENDPOINT2", "OPENAI_TTS_KEY2"),
+        ("OPENAI_TTS_ENDPOINT1", "OPENAI_TTS_KEY1", "OPENAI_TTS_MODEL1"),
+        ("OPENAI_TTS_ENDPOINT2", "OPENAI_TTS_KEY2", "OPENAI_TTS_MODEL2"),
     ],
 )
-async def test_connect_tts(sqlite_instance, endpoint, api_key):
+async def test_connect_tts(sqlite_instance, endpoint, api_key, model_name):
     endpoint_value = _get_required_env_var(endpoint)
     api_key_value = _get_required_env_var(api_key)
+    model_name_value = os.getenv(model_name) if model_name else ""
 
     target = OpenAITTSTarget(
         endpoint=endpoint_value,
         api_key=api_key_value,
+        model_name=model_name_value,
     )
 
     await _assert_can_send_prompt(target, check_if_llm_interpreted_request=False)
 
 
-@pytest.mark.asyncio
+@pytest.mark.run_only_if_all_tests
 @pytest.mark.parametrize(
     ("endpoint", "api_key", "model_name"),
     [
-        ("OPENAI_SORA1_ENDPOINT", "OPENAI_SORA1_KEY", "OPENAI_SORA1_MODEL"),
-        ("OPENAI_SORA2_ENDPOINT", "OPENAI_SORA2_KEY", "OPENAI_SORA2_MODEL"),
-        # OpenAI Platform Sora returns HTTP 401 "Missing scopes: api.videos.write" for all requests
-        # ("PLATFORM_OPENAI_SORA_ENDPOINT", "PLATFORM_OPENAI_SORA_KEY", "PLATFORM_OPENAI_SORA_MODEL"),
+        ("AZURE_OPENAI_VIDEO_ENDPOINT", "AZURE_OPENAI_VIDEO_KEY", "AZURE_OPENAI_VIDEO_MODEL"),
+        # OpenAI Platform endpoint returns HTTP 401 "Missing scopes: api.videos.write" for all requests
+        # ("PLATFORM_OPENAI_VIDEO_ENDPOINT", "PLATFORM_OPENAI_VIDEO_KEY",
+        #  "PLATFORM_OPENAI_VIDEO_MODEL"),
     ],
 )
-async def test_connect_sora(sqlite_instance, endpoint, api_key, model_name):
-    """Test OpenAISoraTarget with both Sora-1 and Sora-2 APIs (auto-detected via endpoint)."""
+async def test_connect_video(sqlite_instance, endpoint, api_key, model_name):
+    """Test OpenAIVideoTarget with video API."""
     endpoint_value = _get_required_env_var(endpoint)
     api_key_value = _get_required_env_var(api_key)
     model_name_value = _get_required_env_var(model_name)
 
-    target = OpenAISoraTarget(
+    target = OpenAIVideoTarget(
         endpoint=endpoint_value,
         api_key=api_key_value,
         model_name=model_name_value,
@@ -281,82 +481,20 @@ async def test_connect_sora(sqlite_instance, endpoint, api_key, model_name):
     await _assert_can_send_video_prompt(target)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("endpoint_var", "api_key_var", "model_var", "resolution"),
-    [
-        # Sora-1 - test unsupported resolution (should return processing error)
-        ("OPENAI_SORA1_ENDPOINT", "OPENAI_SORA1_KEY", "OPENAI_SORA1_MODEL", "640x360"),
-        # Azure OpenAI Sora-2 - test unsupported resolution (should return processing error)
-        ("OPENAI_SORA2_ENDPOINT", "OPENAI_SORA2_KEY", "OPENAI_SORA2_MODEL", "640x360"),
-        # OpenAI Platform Sora - 1024x1792 returns HTTP 401 "Missing scopes: api.videos.write"
-        # ("PLATFORM_OPENAI_SORA_ENDPOINT", "PLATFORM_OPENAI_SORA_KEY", "PLATFORM_OPENAI_SORA_MODEL", "1024x1792"),
-    ],
-)
-async def test_connect_sora_unsupported_resolution_returns_processing_error(
-    sqlite_instance, endpoint_var, api_key_var, model_var, resolution
-):
+@pytest.mark.run_only_if_all_tests
+async def test_video_multiple_prompts_create_separate_files(sqlite_instance):
     """
-    Test that unsupported resolutions return proper processing errors.
-
-    Sora-1: Tests with 640x360 which is not in the supported resolution list.
-    Sora-2: The API spec claims support for 1024x1792 and 1792x1024, but these are
-            not supported on Azure OpenAI Sora-2 (only on Sora-2-Pro).
-
-    This test verifies that such errors are properly categorized as error="processing"
-    rather than crashing or returning unknown error types.
-    """
-    endpoint_value = _get_required_env_var(endpoint_var)
-    api_key_value = _get_required_env_var(api_key_var)
-    model_value = _get_required_env_var(model_var)
-
-    target = OpenAISoraTarget(
-        endpoint=endpoint_value,
-        api_key=api_key_value,
-        model_name=model_value,
-        resolution_dimensions=resolution,
-        n_seconds=4,  # Supported by v2 (4, 8, or 12s)
-    )
-
-    video_prompt = "A raccoon sailing a pirate ship"
-    attack = PromptSendingAttack(objective_target=target)
-    result = await attack.execute_async(objective=video_prompt)
-
-    # Verify we got a response
-    assert result.last_response is not None
-    assert result.last_response.converted_value is not None
-
-    # This resolution should return a processing error (not supported on this account)
-    assert (
-        result.last_response.response_error == "processing"
-    ), f"Expected error type 'processing' for unsupported resolution, got: {result.last_response.response_error}"
-    assert (
-        result.last_response.original_value_data_type == "error"
-    ), f"Expected response type 'error', got: {result.last_response.original_value_data_type}"
-
-    # Verify the error message contains expected information about invalid resolution
-    error_message = result.last_response.converted_value
-    # Both v1 and v2 APIs return errors mentioning the problem
-    assert any(
-        keyword in error_message.lower()
-        for keyword in ["user error", "video_generation_user_error", "invalid", "unsupported", "not supported"]
-    ), f"Expected error message about invalid/unsupported resolution, got: {error_message}"
-
-
-@pytest.mark.asyncio
-async def test_sora_multiple_prompts_create_separate_files(sqlite_instance):
-    """
-    Test that sending multiple prompts to Sora-1 using PromptSendingAttack
+    Test that sending multiple prompts to video API using PromptSendingAttack
     creates separate video files and doesn't override previous files.
 
     This verifies that each video generation creates a unique file based on
-    the task_id/generation_id mechanism.
+    the video ID mechanism.
     """
-    endpoint_value = _get_required_env_var("OPENAI_SORA1_ENDPOINT")
-    api_key_value = _get_required_env_var("OPENAI_SORA1_KEY")
-    model_name_value = _get_required_env_var("OPENAI_SORA1_MODEL")
+    endpoint_value = _get_required_env_var("AZURE_OPENAI_VIDEO_ENDPOINT")
+    api_key_value = _get_required_env_var("AZURE_OPENAI_VIDEO_KEY")
+    model_name_value = _get_required_env_var("AZURE_OPENAI_VIDEO_MODEL")
 
-    target = OpenAISoraTarget(
+    target = OpenAIVideoTarget(
         endpoint=endpoint_value,
         api_key=api_key_value,
         model_name=model_name_value,
@@ -367,9 +505,9 @@ async def test_sora_multiple_prompts_create_separate_files(sqlite_instance):
     attack = PromptSendingAttack(objective_target=target)
     executor = AttackExecutor()
 
-    # Send two prompts using execute_multi_objective_attack_async
+    # Send two prompts using execute_attack_async
     objectives = ["A cat walking on a beach", "A dog running in a park"]
-    results = await executor.execute_multi_objective_attack_async(attack=attack, objectives=objectives)
+    results = await executor.execute_attack_async(attack=attack, objectives=objectives)
 
     # Verify we got 2 results
     assert len(results) == 2, f"Expected 2 results, got {len(results)}"
@@ -403,13 +541,109 @@ async def test_sora_multiple_prompts_create_separate_files(sqlite_instance):
 
     # Verify they are different files (not overridden)
     assert video_path1 != video_path2, (
-        f"Both prompts resulted in the same file path: {video_path1}. " "Expected separate files for different prompts."
+        f"Both prompts resulted in the same file path: {video_path1}. Expected separate files for different prompts."
     )
 
     # Verify both files still exist (first wasn't overridden)
     assert video_path1.exists(), (
-        f"First video file was overridden or deleted. " f"File 1: {video_path1}, File 2: {video_path2}"
+        f"First video file was overridden or deleted. File 1: {video_path1}, File 2: {video_path2}"
     )
+
+
+@pytest.mark.run_only_if_all_tests
+async def test_video_remix_chain(sqlite_instance):
+    """Test text-to-video followed by remix using the returned video_id."""
+    endpoint_value = _get_required_env_var("OPENAI_VIDEO2_ENDPOINT")
+    api_key_value = _get_required_env_var("OPENAI_VIDEO2_KEY")
+    model_name_value = _get_required_env_var("OPENAI_VIDEO2_MODEL")
+
+    target = OpenAIVideoTarget(
+        endpoint=endpoint_value,
+        api_key=api_key_value,
+        model_name=model_name_value,
+        resolution_dimensions="1280x720",
+        n_seconds=4,
+    )
+
+    # Step 1: Generate initial video
+    text_piece = MessagePiece(
+        role="user",
+        original_value="A cat sitting on a windowsill",
+        converted_value="A cat sitting on a windowsill",
+    )
+    result = await target.send_prompt_async(message=Message([text_piece]))
+    assert len(result) == 1
+    response_piece = result[0].message_pieces[0]
+    assert response_piece.response_error == "none"
+    assert response_piece.prompt_metadata is not None
+    video_id = response_piece.prompt_metadata.get("video_id")
+    assert video_id, "Response must include video_id in prompt_metadata for chaining"
+
+    # Step 2: Remix using the returned video_id
+    remix_piece = MessagePiece(
+        role="user",
+        original_value="Make it a watercolor painting style",
+        converted_value="Make it a watercolor painting style",
+        prompt_metadata={"video_id": video_id},
+    )
+    remix_result = await target.send_prompt_async(message=Message([remix_piece]))
+    assert len(remix_result) == 1
+    remix_response = remix_result[0].message_pieces[0]
+    assert remix_response.response_error == "none"
+
+    remix_path = Path(remix_response.converted_value)
+    assert remix_path.exists(), f"Remixed video file not found: {remix_path}"
+    assert remix_path.is_file()
+
+
+@pytest.mark.run_only_if_all_tests
+async def test_video_image_to_video(sqlite_instance):
+    """Test image-to-video mode using an image as the first frame."""
+    endpoint_value = _get_required_env_var("OPENAI_VIDEO2_ENDPOINT")
+    api_key_value = _get_required_env_var("OPENAI_VIDEO2_KEY")
+    model_name_value = _get_required_env_var("OPENAI_VIDEO2_MODEL")
+
+    target = OpenAIVideoTarget(
+        endpoint=endpoint_value,
+        api_key=api_key_value,
+        model_name=model_name_value,
+        resolution_dimensions="1280x720",
+        n_seconds=4,
+    )
+
+    # Prepare an image matching the video resolution (API requires exact match).
+    # Resize a sample image to 1280x720 and save as a temporary JPEG.
+    sample_image = HOME_PATH / "assets" / "pyrit_architecture.png"
+    resized = Image.open(sample_image).resize((1280, 720)).convert("RGB")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)  # noqa: SIM115
+    resized.save(tmp, format="JPEG")
+    tmp.close()
+    image_path = tmp.name
+
+    # Use the image for image-to-video
+    conversation_id = str(uuid.uuid4())
+    text_piece = MessagePiece(
+        role="user",
+        original_value="Animate this image with gentle motion",
+        converted_value="Animate this image with gentle motion",
+        conversation_id=conversation_id,
+    )
+    image_piece = MessagePiece(
+        role="user",
+        original_value=image_path,
+        converted_value=image_path,
+        converted_value_data_type="image_path",
+        conversation_id=conversation_id,
+    )
+    result = await target.send_prompt_async(message=Message([text_piece, image_piece]))
+    assert len(result) == 1
+    response_piece = result[0].message_pieces[0]
+    assert response_piece.response_error == "none", f"Image-to-video failed: {response_piece.converted_value}"
+
+    video_path = Path(response_piece.converted_value)
+    assert video_path.exists(), f"Video file not found: {video_path}"
+    assert video_path.is_file()
 
 
 ##################################################
@@ -419,7 +653,6 @@ async def test_sora_multiple_prompts_create_separate_files(sqlite_instance):
 
 
 @pytest.mark.run_only_if_all_tests
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("endpoint", "api_key", "model_name"),
     [

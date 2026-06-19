@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from pyrit.models import MessagePiece, Score
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
@@ -13,6 +13,9 @@ from pyrit.score.true_false.true_false_score_aggregator import (
 )
 from pyrit.score.true_false.true_false_scorer import TrueFalseScorer
 
+if TYPE_CHECKING:
+    from pyrit.models import ComponentIdentifier
+
 
 class QuestionAnswerScorer(TrueFalseScorer):
     """
@@ -21,7 +24,7 @@ class QuestionAnswerScorer(TrueFalseScorer):
 
     CORRECT_ANSWER_MATCHING_PATTERNS = ["{correct_answer_index}:", "{correct_answer}"]
 
-    _default_validator: ScorerPromptValidator = ScorerPromptValidator(
+    _DEFAULT_VALIDATOR: ScorerPromptValidator = ScorerPromptValidator(
         supported_data_types=["text"], required_metadata=["correct_answer_index", "correct_answer"]
     )
 
@@ -29,8 +32,8 @@ class QuestionAnswerScorer(TrueFalseScorer):
         self,
         *,
         correct_answer_matching_patterns: list[str] = CORRECT_ANSWER_MATCHING_PATTERNS,
-        category: Optional[list[str]] = None,
-        validator: Optional[ScorerPromptValidator] = None,
+        category: list[str] | None = None,
+        validator: ScorerPromptValidator | None = None,
         score_aggregator: TrueFalseAggregatorFunc = TrueFalseScoreAggregator.OR,
     ) -> None:
         """
@@ -40,29 +43,43 @@ class QuestionAnswerScorer(TrueFalseScorer):
             correct_answer_matching_patterns (list[str]): A list of patterns to check for in the response. If any
                 pattern is found in the response, the score will be True. These patterns should be format strings
                 that will be formatted with the correct answer metadata. Defaults to CORRECT_ANSWER_MATCHING_PATTERNS.
-            category (Optional[list[str]]): Optional list of categories for the score. Defaults to None.
-            validator (Optional[ScorerPromptValidator]): Custom validator. Defaults to None.
+            category (list[str] | None): Optional list of categories for the score. Defaults to None.
+            validator (ScorerPromptValidator | None): Custom validator. Defaults to None.
             score_aggregator (TrueFalseAggregatorFunc): The aggregator function to use.
                 Defaults to TrueFalseScoreAggregator.OR.
         """
-        super().__init__(validator=validator or self._default_validator, score_aggregator=score_aggregator)
         self._correct_answer_matching_patterns = correct_answer_matching_patterns
         self._score_category = category if category is not None else []
 
-    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: Optional[str] = None) -> list[Score]:
+        super().__init__(validator=validator or self._DEFAULT_VALIDATOR, score_aggregator=score_aggregator)
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier for this scorer.
+
+        Returns:
+            ComponentIdentifier: The identifier for this scorer.
+        """
+        return self._create_identifier(
+            params={
+                "correct_answer_matching_patterns": self._correct_answer_matching_patterns,
+            },
+            score_aggregator=self._score_aggregator.__name__,  # type: ignore[ty:unresolved-attribute]
+        )
+
+    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: str | None = None) -> list[Score]:
         """
         Score the message piece using question answering evaluation.
 
         Args:
             message_piece (MessagePiece): The answer given by the target, which must contain
                 'correct_answer_index' and 'correct_answer' in prompt_metadata.
-            objective (Optional[str]): The objective to evaluate against. Defaults to None.
+            objective (str | None): The objective to evaluate against. Defaults to None.
                 Currently not used for this scorer.
 
         Returns:
             list[Score]: A list containing a single Score object indicating whether the correct answer was found.
         """
-
         result = False
         matching_text = None
 
@@ -76,7 +93,7 @@ class QuestionAnswerScorer(TrueFalseScorer):
                 matching_text = text
                 break
 
-        scores = [
+        return [
             Score(
                 score_value=str(result),
                 score_value_description="",
@@ -93,5 +110,3 @@ class QuestionAnswerScorer(TrueFalseScorer):
                 objective=objective,
             )
         ]
-
-        return scores

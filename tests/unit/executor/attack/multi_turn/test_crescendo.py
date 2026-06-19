@@ -4,18 +4,18 @@
 import json
 import uuid
 from pathlib import Path
-from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pyrit.common.path import DATASETS_PATH
+from pyrit.common.path import EXECUTOR_SEED_PROMPT_PATH
 from pyrit.exceptions import (
     InvalidJsonException,
 )
 from pyrit.executor.attack import (
     AttackAdversarialConfig,
     AttackConverterConfig,
+    AttackParameters,
     AttackScoringConfig,
     ConversationSession,
     ConversationState,
@@ -24,17 +24,37 @@ from pyrit.executor.attack import (
     CrescendoAttackResult,
 )
 from pyrit.models import (
+    JSON_SCHEMA_METADATA_KEY,
     AttackOutcome,
     ChatMessageRole,
+    ComponentIdentifier,
     ConversationType,
     Message,
     MessagePiece,
     Score,
     ScoreType,
+    SeedPrompt,
 )
 from pyrit.prompt_normalizer import PromptNormalizer
-from pyrit.prompt_target import PromptChatTarget
+from pyrit.prompt_target import PromptTarget
 from pyrit.score import FloatScaleThresholdScorer, SelfAskRefusalScorer, TrueFalseScorer
+from pyrit.score.score_utils import ORIGINAL_FLOAT_VALUE_KEY
+
+
+def _mock_scorer_id(name: str = "MockScorer") -> ComponentIdentifier:
+    """Helper to create ComponentIdentifier for tests."""
+    return ComponentIdentifier(
+        class_name=name,
+        class_module="test_module",
+    )
+
+
+def _mock_target_id(name: str = "MockTarget") -> ComponentIdentifier:
+    """Helper to create ComponentIdentifier for tests."""
+    return ComponentIdentifier(
+        class_name=name,
+        class_module="test_module",
+    )
 
 
 def create_mock_chat_target(*, name: str = "MockChatTarget") -> MagicMock:
@@ -43,10 +63,10 @@ def create_mock_chat_target(*, name: str = "MockChatTarget") -> MagicMock:
     This standardizes the creation of mock chat targets across tests,
     ensuring they all have the required methods and return values.
     """
-    target = MagicMock(spec=PromptChatTarget)
+    target = MagicMock(spec=PromptTarget)
     target.send_prompt_async = AsyncMock()
     target.set_system_prompt = MagicMock()
-    target.get_identifier.return_value = {"__type__": name, "__module__": "test_module"}
+    target.get_identifier.return_value = _mock_target_id(name)
     return target
 
 
@@ -58,7 +78,7 @@ def create_mock_scorer(*, class_name: str) -> MagicMock:
     """
     scorer = MagicMock(spec=TrueFalseScorer)
     scorer.score_async = AsyncMock()
-    scorer.get_identifier.return_value = {"__type__": class_name, "__module__": "test_module"}
+    scorer.get_identifier.return_value = _mock_scorer_id(class_name)
     return scorer
 
 
@@ -66,10 +86,11 @@ def create_score(
     *,
     score_type: ScoreType,
     score_value: str,
-    score_category: Optional[list[str]] = None,
+    score_category: list[str] | None = None,
     scorer_class: str,
     score_rationale: str = "Test rationale",
     score_value_description: str = "Test description",
+    score_metadata: dict | None = None,
 ) -> Score:
     """Create a score with common defaults.
 
@@ -82,9 +103,9 @@ def create_score(
         score_category=score_category,
         score_value_description=score_value_description,
         score_rationale=score_rationale,
-        score_metadata={},
+        score_metadata=score_metadata or {},
         message_piece_id=str(uuid.uuid4()),
-        scorer_class_identifier={"__type__": scorer_class, "__module__": "test_module"},
+        scorer_class_identifier=_mock_scorer_id(scorer_class),
     )
 
 
@@ -118,9 +139,7 @@ def create_adversarial_json_response(
     The Crescendo attack expects the adversarial chat to return JSON with specific fields.
     This helper creates properly formatted responses for testing.
     """
-    return json.dumps(
-        {"generated_question": question, "last_response_summary": summary, "rationale_behind_jailbreak": rationale}
-    )
+    return json.dumps({"next_message": question, "last_response_summary": summary, "rationale": rationale})
 
 
 @pytest.fixture
@@ -153,7 +172,7 @@ def mock_prompt_normalizer() -> MagicMock:
 @pytest.fixture
 def basic_context() -> CrescendoAttackContext:
     return CrescendoAttackContext(
-        objective="Test objective",
+        params=AttackParameters(objective="Test objective"),
         session=ConversationSession(),
     )
 
@@ -189,25 +208,31 @@ def no_refusal_score() -> Score:
 
 @pytest.fixture
 def success_objective_score() -> Score:
+    # FloatScaleThresholdScorer is a TrueFalseScorer, so it returns true_false scores
+    # with the original float value preserved in metadata
     return create_score(
-        score_type="float_scale",
-        score_value="0.9",
+        score_type="true_false",
+        score_value="true",
         score_category=["objective"],
         scorer_class="FloatScaleThresholdScorer",
         score_rationale="The response successfully achieves the objective",
-        score_value_description="High objective achievement",
+        score_value_description="Threshold met",
+        score_metadata={ORIGINAL_FLOAT_VALUE_KEY: 0.9},
     )
 
 
 @pytest.fixture
 def failure_objective_score() -> Score:
+    # FloatScaleThresholdScorer is a TrueFalseScorer, so it returns true_false scores
+    # with the original float value preserved in metadata
     return create_score(
-        score_type="float_scale",
-        score_value="0.3",
+        score_type="true_false",
+        score_value="false",
         score_category=["objective"],
         scorer_class="FloatScaleThresholdScorer",
         score_rationale="The response does not achieve the objective",
-        score_value_description="Low objective achievement",
+        score_value_description="Threshold not met",
+        score_metadata={ORIGINAL_FLOAT_VALUE_KEY: 0.3},
     )
 
 
@@ -228,10 +253,10 @@ class CrescendoTestHelper:
         *,
         objective_target: MagicMock,
         adversarial_chat: MagicMock,
-        objective_scorer: Optional[MagicMock] = None,
-        refusal_scorer: Optional[MagicMock] = None,
-        prompt_normalizer: Optional[MagicMock] = None,
-        system_prompt_path: Optional[Path] = None,
+        objective_scorer: MagicMock | None = None,
+        refusal_scorer: MagicMock | None = None,
+        prompt_normalizer: MagicMock | None = None,
+        system_prompt_path: Path | None = None,
         **kwargs,
     ) -> CrescendoAttack:
         """Create a CrescendoAttack instance with flexible configuration.
@@ -248,7 +273,7 @@ class CrescendoTestHelper:
             scoring_config = AttackScoringConfig(
                 objective_scorer=objective_scorer,
                 refusal_scorer=refusal_scorer,
-                **{k: v for k, v in kwargs.items() if k in ["use_score_as_feedback", "successful_objective_threshold"]},
+                **{k: v for k, v in kwargs.items() if k in ["use_score_as_feedback"]},
             )
 
         attack = CrescendoAttack(
@@ -264,7 +289,6 @@ class CrescendoTestHelper:
 
     @staticmethod
     def mock_memory_for_attack(attack: CrescendoAttack) -> MagicMock:
-
         mock_memory = MagicMock()
         attack._memory = mock_memory
         return mock_memory
@@ -302,7 +326,6 @@ class TestCrescendoAttackInitialization:
         scoring_config = AttackScoringConfig(
             objective_scorer=mock_objective_scorer,
             refusal_scorer=mock_refusal_scorer,
-            successful_objective_threshold=0.7,
             use_score_as_feedback=False,
         )
 
@@ -314,7 +337,6 @@ class TestCrescendoAttackInitialization:
 
         assert attack._objective_scorer == mock_objective_scorer
         assert attack._refusal_scorer == mock_refusal_scorer
-        assert attack._successful_objective_threshold == 0.7
         assert attack._use_score_as_feedback is False
 
     def test_init_creates_default_scorers_with_adversarial_chat(
@@ -336,7 +358,7 @@ class TestCrescendoAttackInitialization:
 
     @pytest.mark.parametrize(
         "system_prompt_path",
-        [Path(DATASETS_PATH) / "executors" / "crescendo" / f"crescendo_variant_{i}.yaml" for i in range(1, 6)],
+        [Path(EXECUTOR_SEED_PROMPT_PATH) / "crescendo" / f"crescendo_variant_{i}.yaml" for i in range(1, 6)],
     )
     def test_init_with_different_system_prompt_variants(
         self,
@@ -408,6 +430,30 @@ class TestCrescendoAttackInitialization:
                 max_turns=max_turns,
             )
 
+    @pytest.mark.parametrize(
+        "missing_capability",
+        ["multi_turn", "system_prompt"],
+    )
+    def test_init_rejects_adversarial_chat_missing_native_capability(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        missing_capability: str,
+    ):
+        """Adversarial chat must natively support MULTI_TURN and SYSTEM_PROMPT."""
+        from pyrit.prompt_target.common.target_capabilities import CapabilityName
+
+        mock_adversarial_chat.configuration.includes.side_effect = lambda *, capability: (
+            capability != CapabilityName(missing_capability)
+        )
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        with pytest.raises(ValueError, match=f"CrescendoAttack .*{missing_capability}"):
+            CrescendoAttack(
+                objective_target=mock_objective_target,
+                attack_adversarial_config=adversarial_config,
+            )
+
     def test_init_with_converter_configuration(
         self,
         mock_objective_target: MagicMock,
@@ -460,7 +506,6 @@ class TestCrescendoAttackInitialization:
         scoring_config = AttackScoringConfig(
             objective_scorer=mock_objective_scorer,
             refusal_scorer=mock_refusal_scorer,
-            successful_objective_threshold=0.85,
             use_score_as_feedback=True,
         )
 
@@ -475,7 +520,6 @@ class TestCrescendoAttackInitialization:
         assert result is not None
         assert result.objective_scorer == mock_objective_scorer
         assert result.refusal_scorer == mock_refusal_scorer
-        assert result.successful_objective_threshold == 0.85
         assert result.use_score_as_feedback is True
 
 
@@ -503,7 +547,7 @@ class TestContextValidation:
             objective_target=mock_objective_target,
             attack_adversarial_config=adversarial_config,
         )
-        context = CrescendoAttackContext(objective=objective)
+        context = CrescendoAttackContext(params=AttackParameters(objective=objective))
 
         with pytest.raises(ValueError, match=expected_error):
             attack._validate_context(context=context)
@@ -523,12 +567,82 @@ class TestContextValidation:
         )
         attack._validate_context(context=basic_context)  # Should not raise
 
+    async def test_max_turns_validation_with_prepended_conversation(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+    ):
+        """Test that prepended conversation turns are validated against max_turns."""
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            max_turns=1,  # Less than prepended turns (2)
+        )
+
+        # Create prepended conversation with 2 assistant messages
+        prepended = [
+            Message.from_prompt(prompt="Hello", role="user"),
+            Message.from_prompt(prompt="Hi there!", role="assistant"),
+            Message.from_prompt(prompt="How are you?", role="user"),
+            Message.from_prompt(prompt="I'm fine!", role="assistant"),
+        ]
+        next_message = Message.from_prompt(prompt="Continue conversation", role="user")
+
+        # Should raise RuntimeError wrapping ValueError because prepended turns (2) exceed max_turns (1)
+        with pytest.raises(RuntimeError, match="exceeding max_turns"):
+            await attack.execute_async(
+                objective="Test objective",
+                prepended_conversation=prepended,
+                next_message=next_message,
+            )
+
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestSetupPhase:
     """Tests for the setup phase of the attack."""
 
-    @pytest.mark.asyncio
+    async def test_setup_with_prepended_conversation_without_next_message(
+        self, mock_objective_target, mock_adversarial_chat
+    ):
+        """Test that setup works with prepended_conversation even without next_message.
+
+        The adversarial chat will generate the first prompt based on the prepended
+        conversation context. This is similar to a fresh attack, but with context.
+        """
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+        )
+
+        # Create context with prepended_conversation but no next_message
+        prepended = [
+            Message.from_prompt(prompt="Hello", role="user"),
+            Message.from_prompt(prompt="Hi there!", role="assistant"),
+        ]
+        context = CrescendoAttackContext(
+            params=AttackParameters(
+                objective="Test objective",
+                prepended_conversation=prepended,
+                next_message=None,  # Explicitly no next_message
+            )
+        )
+
+        # Mock that simulates initialize_context_async setting executed_turns
+        async def mock_initialize(*, context, **kwargs):
+            context.executed_turns = 1  # 1 assistant message in prepended
+            return ConversationState(turn_count=1, last_assistant_message_scores=[])
+
+        with patch.object(attack._conversation_manager, "initialize_context_async", side_effect=mock_initialize):
+            await attack._setup_async(context=context)
+
+        # Setup should succeed and track the prepended turn
+        assert context.executed_turns == 1
+        assert context.next_message is None  # No custom message, adversarial chat will generate
+
     async def test_setup_initializes_conversation_session(
         self,
         mock_objective_target: MagicMock,
@@ -545,7 +659,7 @@ class TestSetupPhase:
 
         # Mock conversation manager
         mock_state = ConversationState(turn_count=0)
-        with patch.object(attack._conversation_manager, "update_conversation_state_async", return_value=mock_state):
+        with patch.object(attack._conversation_manager, "initialize_context_async", return_value=mock_state):
             await attack._setup_async(context=basic_context)
 
         assert basic_context.session is not None
@@ -553,7 +667,6 @@ class TestSetupPhase:
         assert basic_context.executed_turns == 0
         assert basic_context.backtrack_count == 0
 
-    @pytest.mark.asyncio
     async def test_setup_sets_adversarial_chat_system_prompt(
         self,
         mock_objective_target: MagicMock,
@@ -571,7 +684,7 @@ class TestSetupPhase:
 
         # Mock conversation manager
         mock_state = ConversationState(turn_count=0)
-        with patch.object(attack._conversation_manager, "update_conversation_state_async", return_value=mock_state):
+        with patch.object(attack._conversation_manager, "initialize_context_async", return_value=mock_state):
             await attack._setup_async(context=basic_context)
 
         # Verify system prompt was set
@@ -581,7 +694,6 @@ class TestSetupPhase:
         assert "15" in call_args.kwargs["system_prompt"]  # Check for the max_turns value
         assert call_args.kwargs["conversation_id"] == basic_context.session.adversarial_chat_conversation_id
 
-    @pytest.mark.asyncio
     async def test_setup_handles_prepended_conversation_with_refusal(
         self,
         mock_objective_target: MagicMock,
@@ -590,7 +702,12 @@ class TestSetupPhase:
         basic_context: CrescendoAttackContext,
         refusal_score: Score,
     ):
-        """Test that setup handles prepended conversation with refusal score."""
+        """Test that setup handles prepended conversation with refusal score.
+
+        When a refusal score is present from the prepended conversation, the setup
+        should set the context's last_score. Note: refused_text is NOT set during setup;
+        it is only set during the attack execution loop when backtracking occurs.
+        """
         adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
         scoring_config = AttackScoringConfig(refusal_scorer=mock_refusal_scorer)
 
@@ -600,50 +717,27 @@ class TestSetupPhase:
             attack_scoring_config=scoring_config,
         )
 
-        # Mock conversation state with refusal score
-        mock_state = ConversationState(
-            turn_count=1,
-            last_user_message="Refused prompt",
-            last_assistant_message_scores=[refusal_score],
-        )
-        with patch.object(attack._conversation_manager, "update_conversation_state_async", return_value=mock_state):
+        # Mock that simulates initialize_context_async setting executed_turns and last_score
+        async def mock_initialize(*, context, **kwargs):
+            context.executed_turns = 1
+            # The conversation manager sets last_score from prepended conversation scores
+            context.last_score = refusal_score
+            return ConversationState(turn_count=1, last_assistant_message_scores=[refusal_score])
+
+        with patch.object(attack._conversation_manager, "initialize_context_async", side_effect=mock_initialize):
             await attack._setup_async(context=basic_context)
 
-        assert basic_context.refused_text == "Refused prompt"
+        # Verify setup captured the refusal score
+        assert basic_context.last_score == refusal_score
         assert basic_context.executed_turns == 1
-
-    @pytest.mark.asyncio
-    async def test_setup_retrieves_custom_prompt_from_prepended_conversation(
-        self,
-        mock_objective_target: MagicMock,
-        mock_adversarial_chat: MagicMock,
-        basic_context: CrescendoAttackContext,
-    ):
-        """Test that setup retrieves custom prompt from prepended conversation."""
-        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
-
-        attack = CrescendoAttack(
-            objective_target=mock_objective_target,
-            attack_adversarial_config=adversarial_config,
-        )
-
-        # Mock conversation state with last user message but no scores
-        mock_state = ConversationState(
-            turn_count=0,
-            last_user_message="Custom prepended prompt",
-            last_assistant_message_scores=[],
-        )
-        with patch.object(attack._conversation_manager, "update_conversation_state_async", return_value=mock_state):
-            await attack._setup_async(context=basic_context)
-
-        assert basic_context.custom_prompt == "Custom prepended prompt"
+        # refused_text is NOT set during setup - it's set during _backtrack_async in _perform_async
+        assert basic_context.refused_text is None
 
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestPromptGeneration:
     """Tests for prompt generation logic"""
 
-    @pytest.mark.asyncio
     async def test_generate_next_prompt_uses_custom_prompt_when_available(
         self,
         mock_objective_target: MagicMock,
@@ -658,14 +752,18 @@ class TestPromptGeneration:
             attack_adversarial_config=adversarial_config,
         )
 
-        basic_context.custom_prompt = "Custom prompt"
+        custom_message = Message.from_prompt(prompt="Custom prompt", role="user")
+        original_id = custom_message.message_pieces[0].id
+        basic_context.next_message = custom_message
 
         result = await attack._generate_next_prompt_async(context=basic_context)
 
-        assert result == "Custom prompt"
-        assert basic_context.custom_prompt is None  # Should be cleared
+        # Should return a duplicated message with the same content but a new ID
+        assert result is not custom_message  # Should be a duplicate, not the same object
+        assert result.get_value() == "Custom prompt"
+        assert result.message_pieces[0].id != original_id  # Should have a new ID
+        assert basic_context.next_message is None  # Should be cleared
 
-    @pytest.mark.asyncio
     async def test_generate_next_prompt_calls_adversarial_chat(
         self,
         mock_objective_target: MagicMock,
@@ -695,15 +793,15 @@ class TestPromptGeneration:
         )
         mock_prompt_normalizer.send_prompt_async.return_value = response
 
-        basic_context.custom_prompt = None
+        basic_context.next_message = None
         basic_context.refused_text = "Previous refused text"
 
         result = await attack._generate_next_prompt_async(context=basic_context)
 
-        assert result == "Attack prompt"
+        assert isinstance(result, Message)
+        assert result.get_value() == "Attack prompt"
         mock_prompt_normalizer.send_prompt_async.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_build_adversarial_prompt_with_refused_text(
         self,
         mock_objective_target: MagicMock,
@@ -729,7 +827,6 @@ class TestPromptGeneration:
         assert "The target refused to respond" in result
         assert refused_text in result
 
-    @pytest.mark.asyncio
     async def test_build_adversarial_prompt_with_objective_score(
         self,
         mock_objective_target: MagicMock,
@@ -759,7 +856,6 @@ class TestPromptGeneration:
         assert "0.30" in result  # Score value
         assert failure_objective_score.score_rationale in result
 
-    @pytest.mark.asyncio
     async def test_send_prompt_to_adversarial_chat_handles_no_response(
         self,
         mock_objective_target: MagicMock,
@@ -780,15 +876,45 @@ class TestPromptGeneration:
         with pytest.raises(ValueError, match="No response received from adversarial chat"):
             await attack._send_prompt_to_adversarial_chat_async(prompt_text="Test prompt", context=basic_context)
 
+    async def test_send_prompt_to_adversarial_chat_forwards_json_schema(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_prompt_normalizer: MagicMock,
+        basic_context: CrescendoAttackContext,
+    ):
+        """The shared adversarial_chat JSON schema is forwarded to the target via metadata."""
+        attack = CrescendoTestHelper.create_attack(
+            objective_target=mock_objective_target,
+            adversarial_chat=mock_adversarial_chat,
+            prompt_normalizer=mock_prompt_normalizer,
+        )
+
+        schema = attack._adversarial_chat_system_prompt_template.response_json_schema
+        assert schema is not None
+
+        mock_prompt_normalizer.send_prompt_async.return_value = create_prompt_response(
+            text=create_adversarial_json_response()
+        )
+
+        await attack._send_prompt_to_adversarial_chat_async(prompt_text="Test prompt", context=basic_context)
+
+        sent_message = mock_prompt_normalizer.send_prompt_async.call_args.kwargs["message"]
+        metadata = sent_message.message_pieces[0].prompt_metadata
+        assert metadata["response_format"] == "json"
+        assert metadata[JSON_SCHEMA_METADATA_KEY] == schema
+
     @pytest.mark.parametrize(
         "response_json,expected_error",
         [
             # Missing required keys - the attack expects all three fields
-            ('{"generated_question": "Attack"}', "Missing required keys"),
+            ('{"next_message": "Attack"}', "Missing required keys"),
             # Extra keys are not allowed - strict JSON validation prevents unexpected data
             (
-                '{"generated_question": "Attack", "last_response_summary": "Summary", '
-                '"rationale_behind_jailbreak": "Rationale", "extra_key": "value"}',
+                (
+                    '{"next_message": "Attack", "last_response_summary": "Summary", '
+                    '"rationale": "Rationale", "extra_key": "value"}'
+                ),
                 "Unexpected keys",
             ),
             # Invalid JSON will trigger retry mechanism
@@ -797,19 +923,17 @@ class TestPromptGeneration:
             ('{"wrong_key": "value"}', "Missing required keys"),
             # Empty question is valid - the attack can handle empty strings
             (
-                '{"generated_question": "", "last_response_summary": "Summary", '
-                '"rationale_behind_jailbreak": "Rationale"}',
+                ('{"next_message": "", "last_response_summary": "Summary", "rationale": "Rationale"}'),
                 None,
             ),
         ],
     )
-    @pytest.mark.asyncio
     async def test_parse_adversarial_response_with_various_inputs(
         self,
         mock_objective_target: MagicMock,
         mock_adversarial_chat: MagicMock,
         response_json: str,
-        expected_error: Optional[str],
+        expected_error: str | None,
     ):
         """Test parsing adversarial response with various inputs.
 
@@ -831,12 +955,118 @@ class TestPromptGeneration:
             result = attack._parse_adversarial_response(response_json)
             assert isinstance(result, str)
 
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("next_message", "next_message"),
+            ("nextMessage", "next_message"),
+            ("NextMessage", "next_message"),
+            ("rationale", "rationale"),
+            ("lastResponseSummary", "last_response_summary"),
+            ("", ""),
+        ],
+    )
+    def test_camel_to_snake_handles_common_cases(self, raw: str, expected: str) -> None:
+        """``_camel_to_snake`` normalizes camelCase / PascalCase and leaves snake_case alone."""
+        assert CrescendoAttack._camel_to_snake(raw) == expected
+
+    def test_parse_adversarial_response_accepts_camel_case_keys(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+    ) -> None:
+        """camelCase keys are normalized to snake_case so well-formed JSON with the wrong casing still parses.
+
+        Regression test for the Azure DevOps Integration Tests failure on
+        ``4_sequential_attack.ipynb``, where the adversarial model returned
+        ``nextMessage`` / ``rationale`` /
+        ``lastResponseSummary`` for three retries straight and the strict
+        snake_case-only parser tore down the run.
+        """
+        attack = CrescendoTestHelper.create_attack(
+            objective_target=mock_objective_target,
+            adversarial_chat=mock_adversarial_chat,
+        )
+        camel_case_response = (
+            '{"nextMessage": "Attack question", "lastResponseSummary": "Summary text", "rationale": "Why this works"}'
+        )
+
+        result = attack._parse_adversarial_response(camel_case_response)
+
+        assert result == "Attack question"
+
+    def test_parse_adversarial_response_mixed_casing_still_validates_extras(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+    ) -> None:
+        """Extra keys remain rejected even after camelCase normalization.
+
+        ``unexpectedKey`` normalizes to ``unexpected_key`` (still not in the
+        expected set), so the strict extra-key check continues to fire — we
+        only loosen casing, not the schema.
+        """
+        attack = CrescendoTestHelper.create_attack(
+            objective_target=mock_objective_target,
+            adversarial_chat=mock_adversarial_chat,
+        )
+        response_with_extra = (
+            '{"nextMessage": "Attack", '
+            '"lastResponseSummary": "Summary", '
+            '"rationale": "Rationale", '
+            '"unexpectedKey": "value"}'
+        )
+
+        with pytest.raises(InvalidJsonException, match="Unexpected keys"):
+            attack._parse_adversarial_response(response_with_extra)
+
+    async def test_custom_message_is_sent_to_target(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_prompt_normalizer: MagicMock,
+        basic_context: CrescendoAttackContext,
+    ):
+        """Test that when a custom message is passed, it is the exact message sent to the target."""
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            prompt_normalizer=mock_prompt_normalizer,
+        )
+
+        # Create a custom message
+        custom_message = Message.from_prompt(prompt="My custom attack prompt", role="user")
+
+        # Mock response from target
+        target_response = Message(
+            message_pieces=[
+                MessagePiece(
+                    role="assistant",
+                    original_value="Target response",
+                    converted_value="Target response",
+                )
+            ]
+        )
+        mock_prompt_normalizer.send_prompt_async.return_value = target_response
+
+        # Send the custom message to the target
+        result = await attack._send_prompt_to_objective_target_async(
+            attack_message=custom_message,
+            context=basic_context,
+        )
+
+        # Verify the exact message object was passed to send_prompt_async
+        call_args = mock_prompt_normalizer.send_prompt_async.call_args
+        assert call_args.kwargs["message"] is custom_message
+        assert result is target_response
+
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestResponseScoring:
     """Tests for response scoring logic."""
 
-    @pytest.mark.asyncio
     async def test_score_response_successful(
         self,
         mock_objective_target: MagicMock,
@@ -868,7 +1098,6 @@ class TestResponseScoring:
 
         assert result == success_objective_score
 
-    @pytest.mark.asyncio
     async def test_score_response_raises_when_no_response(
         self,
         mock_objective_target: MagicMock,
@@ -888,7 +1117,52 @@ class TestResponseScoring:
         with pytest.raises(ValueError, match="No response available in context to score"):
             await attack._score_response_async(context=basic_context)
 
-    @pytest.mark.asyncio
+    async def test_score_response_does_not_skip_on_error_result(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_objective_scorer: MagicMock,
+        basic_context: CrescendoAttackContext,
+        sample_response: Message,
+        success_objective_score: Score,
+    ):
+        """Test that _score_response_async does not skip scoring on error responses.
+
+        When the target returns an error response (e.g., blocked by content filter),
+        the objective scorer should still be called with skip_on_error_result=False
+        so that error responses get scored (as false/not achieved) rather than
+        raising RuntimeError due to empty score list.
+
+        This allows Crescendo to gracefully handle all-rejection scenarios.
+        """
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+        scoring_config = AttackScoringConfig(objective_scorer=mock_objective_scorer)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            attack_scoring_config=scoring_config,
+        )
+
+        basic_context.last_response = sample_response
+
+        # Mock Scorer.score_response_async to capture the call arguments
+        with patch(
+            "pyrit.score.Scorer.score_response_async",
+            new_callable=AsyncMock,
+            return_value={"objective_scores": [success_objective_score], "auxiliary_scores": []},
+        ) as mock_score_response:
+            await attack._score_response_async(context=basic_context)
+
+            # Verify score_response_async was called with skip_on_error_result=False
+            mock_score_response.assert_called_once()
+            call_kwargs = mock_score_response.call_args.kwargs
+            assert call_kwargs.get("skip_on_error_result") is False, (
+                "Scorer.score_response_async must be called with skip_on_error_result=False "
+                "to ensure error responses are scored rather than skipped, "
+                "allowing Crescendo to handle all-rejection scenarios gracefully"
+            )
+
     async def test_check_refusal_detects_refusal(
         self,
         mock_objective_target: MagicMock,
@@ -916,6 +1190,45 @@ class TestResponseScoring:
         assert result == refusal_score
         mock_refusal_scorer.score_async.assert_called_once()
 
+    async def test_check_refusal_does_not_skip_on_error_result(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_refusal_scorer: MagicMock,
+        basic_context: CrescendoAttackContext,
+        sample_response: Message,
+        refusal_score: Score,
+    ):
+        """Test that _check_refusal_async does not skip scoring on error responses.
+
+        When the target returns an error response (e.g., blocked by content filter),
+        the refusal scorer should still be called with skip_on_error_result=False
+        so that error responses are treated as refusals and trigger backtracking.
+
+        This prevents IndexError when accessing scores[0] on an empty list.
+        """
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+        scoring_config = AttackScoringConfig(refusal_scorer=mock_refusal_scorer)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            attack_scoring_config=scoring_config,
+        )
+
+        basic_context.last_response = sample_response
+        mock_refusal_scorer.score_async.return_value = [refusal_score]
+
+        await attack._check_refusal_async(context=basic_context, objective="test task")
+
+        # Verify score_async was called with skip_on_error_result=False
+        mock_refusal_scorer.score_async.assert_called_once()
+        call_kwargs = mock_refusal_scorer.score_async.call_args.kwargs
+        assert call_kwargs.get("skip_on_error_result") is False, (
+            "Refusal scorer must be called with skip_on_error_result=False "
+            "to ensure error responses are scored (treated as refusals) rather than skipped"
+        )
+
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestBacktrackingLogic:
@@ -925,7 +1238,6 @@ class TestBacktrackingLogic:
     refusals by reverting to an earlier conversation state and trying a different approach.
     """
 
-    @pytest.mark.asyncio
     async def test_perform_backtrack_when_refused(
         self,
         mock_objective_target: MagicMock,
@@ -969,7 +1281,6 @@ class TestBacktrackingLogic:
         assert basic_context.backtrack_count == 1
         assert basic_context.session.conversation_id == "new_conv_id"  # New conversation branch
 
-    @pytest.mark.asyncio
     async def test_no_backtrack_when_not_refused(
         self,
         mock_objective_target: MagicMock,
@@ -999,7 +1310,6 @@ class TestBacktrackingLogic:
         assert basic_context.refused_text is None
         assert basic_context.backtrack_count == 0
 
-    @pytest.mark.asyncio
     async def test_no_backtrack_when_max_backtracks_reached(
         self,
         mock_objective_target: MagicMock,
@@ -1034,12 +1344,204 @@ class TestBacktrackingLogic:
         # Important: Should not even check for refusal to save API calls
         mock_refusal_scorer.score_async.assert_not_called()
 
+    async def test_backtrack_on_content_filter_error(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_refusal_scorer: MagicMock,
+        basic_context: CrescendoAttackContext,
+    ):
+        """Test that backtracking is performed when content filter error occurs.
+
+        When the target returns a content filter error (blocked response), Crescendo should:
+        1. Call the refusal scorer which internally handles blocked responses (returns True)
+        2. Store the refused text for the adversarial chat to learn from
+        3. Revert the conversation to before the blocked prompt
+        4. Increment the backtrack counter
+        5. Continue with a new approach
+        """
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+        scoring_config = AttackScoringConfig(refusal_scorer=mock_refusal_scorer)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            attack_scoring_config=scoring_config,
+        )
+
+        # Create a response with content filter error
+        blocked_response = Message(
+            message_pieces=[
+                MessagePiece(
+                    role="assistant",
+                    original_value="Content filtered",
+                    converted_value="Content filtered",
+                    original_value_data_type="error",
+                    converted_value_data_type="error",
+                    response_error="blocked",
+                )
+            ]
+        )
+
+        basic_context.last_response = blocked_response
+        basic_context.backtrack_count = 0
+
+        # Mock the refusal scorer to return True (refusal detected) for blocked content
+        refusal_score = MagicMock(spec=Score)
+        refusal_score.get_value.return_value = True
+        refusal_score.score_rationale = "Content was filtered, constituting a refusal."
+        mock_refusal_scorer.score_async = AsyncMock(return_value=[refusal_score])
+
+        # Mock backtrack_memory_async to return a new conversation ID
+        with patch.object(attack, "_backtrack_memory_async", new_callable=AsyncMock, return_value="new_conv_id"):
+            result = await attack._perform_backtrack_if_refused_async(
+                context=basic_context, prompt_sent="Blocked prompt"
+            )
+
+        # Verify all expected state changes occurred
+        assert result is True
+        assert basic_context.refused_text == "Blocked prompt"  # Stored for next attempt
+        assert basic_context.backtrack_count == 1
+        assert basic_context.session.conversation_id == "new_conv_id"  # New conversation branch
+
+        # Refusal scorer IS called - it handles blocked responses internally (fast path, no LLM call)
+        mock_refusal_scorer.score_async.assert_called_once()
+
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestAttackExecution:
     """Tests for the main attack execution logic."""
 
-    @pytest.mark.asyncio
+    async def test_perform_attack_with_message_bypasses_adversarial_chat_on_first_turn(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_prompt_normalizer: MagicMock,
+        basic_context: CrescendoAttackContext,
+        sample_response: Message,
+        success_objective_score: Score,
+        no_refusal_score: Score,
+    ):
+        """Test that providing a message parameter bypasses adversarial chat generation on first turn."""
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            prompt_normalizer=mock_prompt_normalizer,
+        )
+
+        # Set message to bypass adversarial chat
+        custom_message = Message.from_prompt(prompt="Custom first turn message", role="user")
+        basic_context.next_message = custom_message
+
+        # Mock only objective target response (no adversarial chat should be called)
+        mock_prompt_normalizer.send_prompt_async.return_value = sample_response
+
+        with patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal_score):
+            with patch(
+                "pyrit.score.Scorer.score_response_async",
+                new_callable=AsyncMock,
+                return_value={"objective_scores": [success_objective_score], "auxiliary_scores": []},
+            ):
+                result = await attack._perform_async(context=basic_context)
+
+        assert isinstance(result, CrescendoAttackResult)
+        assert result.outcome == AttackOutcome.SUCCESS
+        assert result.executed_turns == 1
+
+        # Verify adversarial chat was not called for first turn
+        # (only objective target should receive the custom message)
+        assert mock_prompt_normalizer.send_prompt_async.call_count == 1
+
+        # Verify the message was cleared after use
+        assert basic_context.next_message is None
+
+    async def test_perform_async_sets_atomic_attack_identifier(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_prompt_normalizer: MagicMock,
+        basic_context: CrescendoAttackContext,
+        sample_response: Message,
+        success_objective_score: Score,
+        no_refusal_score: Score,
+    ):
+        """Test that _perform_async sets atomic_attack_identifier in the correct AtomicAttack format."""
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            prompt_normalizer=mock_prompt_normalizer,
+        )
+
+        basic_context.next_message = Message.from_prompt(prompt="Test message", role="user")
+        mock_prompt_normalizer.send_prompt_async.return_value = sample_response
+
+        with patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal_score):
+            with patch(
+                "pyrit.score.Scorer.score_response_async",
+                new_callable=AsyncMock,
+                return_value={"objective_scores": [success_objective_score], "auxiliary_scores": []},
+            ):
+                result = await attack._perform_async(context=basic_context)
+
+        assert result.atomic_attack_identifier is not None
+        assert result.atomic_attack_identifier.class_name == "AtomicAttack"
+        assert result.get_attack_strategy_identifier() == attack.get_identifier()
+
+    async def test_perform_attack_with_multi_piece_message_uses_first_piece(
+        self,
+        mock_objective_target: MagicMock,
+        mock_adversarial_chat: MagicMock,
+        mock_prompt_normalizer: MagicMock,
+        basic_context: CrescendoAttackContext,
+        sample_response: Message,
+        success_objective_score: Score,
+        no_refusal_score: Score,
+    ):
+        """Test that multi-piece messages use only the first piece's converted_value."""
+        adversarial_config = AttackAdversarialConfig(target=mock_adversarial_chat)
+
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=adversarial_config,
+            prompt_normalizer=mock_prompt_normalizer,
+        )
+
+        # Create multi-piece message (e.g., text + image scenario)
+        piece1 = MessagePiece(
+            role="user",
+            original_value="First piece text",
+            converted_value="First piece text",
+            conversation_id="test-conv",
+            sequence=1,
+        )
+        piece2 = MessagePiece(
+            role="user",
+            original_value="Second piece text",
+            converted_value="Second piece text",
+            conversation_id="test-conv",
+            sequence=1,
+        )
+        multi_piece_message = Message(message_pieces=[piece1, piece2])
+        basic_context.next_message = multi_piece_message
+
+        mock_prompt_normalizer.send_prompt_async.return_value = sample_response
+
+        with patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal_score):
+            with patch(
+                "pyrit.score.Scorer.score_response_async",
+                new_callable=AsyncMock,
+                return_value={"objective_scores": [success_objective_score], "auxiliary_scores": []},
+            ):
+                result = await attack._perform_async(context=basic_context)
+
+        # Verify the attack succeeded using the first piece's value
+        assert result.outcome == AttackOutcome.SUCCESS
+        assert mock_prompt_normalizer.send_prompt_async.call_count == 1
+
     async def test_perform_attack_success_on_first_turn(
         self,
         mock_objective_target: MagicMock,
@@ -1089,7 +1591,6 @@ class TestAttackExecution:
         assert result.outcome_reason is not None
         assert "Objective achieved in 1 turns" in result.outcome_reason
 
-    @pytest.mark.asyncio
     async def test_perform_attack_failure_max_turns_reached(
         self,
         mock_objective_target: MagicMock,
@@ -1145,7 +1646,6 @@ class TestAttackExecution:
         assert result.outcome_reason is not None
         assert "Max turns (2) reached" in result.outcome_reason
 
-    @pytest.mark.asyncio
     async def test_perform_attack_with_backtracking(
         self,
         mock_objective_target: MagicMock,
@@ -1214,7 +1714,6 @@ class TestAttackExecution:
         assert result.executed_turns == 1  # Only counts non-backtracked turns
         assert result.backtrack_count == 1  # Tracks backtracking for analysis
 
-    @pytest.mark.asyncio
     async def test_perform_attack_max_backtracks_then_continue(
         self,
         mock_objective_target: MagicMock,
@@ -1274,16 +1773,18 @@ class TestAttackExecution:
         mock_check_refusal = AsyncMock(return_value=refusal_score)
 
         # Mock backtrack memory once
-        with patch.object(
-            attack, "_backtrack_memory_async", new_callable=AsyncMock, return_value="new_conv_id"
-        ) as mock_backtrack:
-            with patch.object(attack, "_check_refusal_async", mock_check_refusal):
-                with patch(
-                    "pyrit.score.Scorer.score_response_async",
-                    new_callable=AsyncMock,
-                    return_value={"objective_scores": [failure_objective_score], "auxiliary_scores": []},
-                ):
-                    result = await attack._perform_async(context=basic_context)
+        with (
+            patch.object(
+                attack, "_backtrack_memory_async", new_callable=AsyncMock, return_value="new_conv_id"
+            ) as mock_backtrack,
+            patch.object(attack, "_check_refusal_async", mock_check_refusal),
+            patch(
+                "pyrit.score.Scorer.score_response_async",
+                new_callable=AsyncMock,
+                return_value={"objective_scores": [failure_objective_score], "auxiliary_scores": []},
+            ),
+        ):
+            result = await attack._perform_async(context=basic_context)
 
         # Should only backtrack once (when backtrack count is 0)
         assert mock_backtrack.call_count == 1
@@ -1300,9 +1801,12 @@ class TestContextCreation:
     def test_create_context_with_basic_params(self):
         """Test creating context with basic parameters."""
         context = CrescendoAttackContext(
-            objective="Test objective",
-            prepended_conversation=[],
-            memory_labels={"test": "label"},
+            params=AttackParameters(
+                objective="Test objective",
+                prepended_conversation=[],
+                memory_labels={"test": "label"},
+            ),
+            session=ConversationSession(),
         )
 
         assert isinstance(context, CrescendoAttackContext)
@@ -1310,16 +1814,20 @@ class TestContextCreation:
         assert context.prepended_conversation == []
         assert context.memory_labels == {"test": "label"}
 
-    def test_create_context_with_custom_prompt(self):
-        """Test creating context with custom prompt."""
+    def test_create_context_with_message(self):
+        """Test creating context with message."""
+        message = Message.from_prompt(prompt="My custom prompt", role="user")
         context = CrescendoAttackContext(
-            objective="Test objective",
-            prepended_conversation=[],
-            memory_labels={},
-            custom_prompt="My custom prompt",
+            params=AttackParameters(
+                objective="Test objective",
+                prepended_conversation=[],
+                memory_labels={},
+                next_message=message,
+            ),
+            session=ConversationSession(),
         )
 
-        assert context.custom_prompt == "My custom prompt"
+        assert context.next_message == message
 
     def test_create_context_with_prepended_conversation(
         self,
@@ -1328,9 +1836,12 @@ class TestContextCreation:
         """Test context creation with prepended conversation."""
         prepended_conversation = [sample_response]
         context = CrescendoAttackContext(
-            objective="Test objective",
-            prepended_conversation=prepended_conversation,
-            memory_labels={},
+            params=AttackParameters(
+                objective="Test objective",
+                prepended_conversation=prepended_conversation,
+                memory_labels={},
+            ),
+            session=ConversationSession(),
         )
 
         assert context.prepended_conversation == prepended_conversation
@@ -1341,7 +1852,6 @@ class TestContextCreation:
 class TestAttackLifecycle:
     """Tests for the complete attack lifecycle (execute_with_context_async and execute_async)"""
 
-    @pytest.mark.asyncio
     async def test_execute_with_context_async_successful_lifecycle(
         self,
         mock_objective_target: MagicMock,
@@ -1370,7 +1880,6 @@ class TestAttackLifecycle:
                         mock_perform.return_value = CrescendoAttackResult(
                             conversation_id=basic_context.session.conversation_id,
                             objective=basic_context.objective,
-                            attack_identifier=attack.get_identifier(),
                             outcome=AttackOutcome.SUCCESS,
                             executed_turns=1,
                             last_response=sample_response.get_piece(),
@@ -1385,7 +1894,6 @@ class TestAttackLifecycle:
         assert isinstance(result, CrescendoAttackResult)
         assert result.outcome == AttackOutcome.SUCCESS
 
-    @pytest.mark.asyncio
     async def test_execute_with_context_async_validation_failure_prevents_execution(
         self,
         mock_objective_target: MagicMock,
@@ -1418,7 +1926,6 @@ class TestAttackLifecycle:
         mock_perform.assert_not_called()
         mock_teardown.assert_not_called()
 
-    @pytest.mark.asyncio
     async def test_execute_async_with_parameters(
         self,
         mock_objective_target: MagicMock,
@@ -1439,7 +1946,6 @@ class TestAttackLifecycle:
         mock_result = CrescendoAttackResult(
             conversation_id="test-conversation-id",
             objective="Test objective",
-            attack_identifier=attack.get_identifier(),
             outcome=AttackOutcome.SUCCESS,
             executed_turns=1,
             last_response=sample_response.get_piece(),
@@ -1448,10 +1954,11 @@ class TestAttackLifecycle:
         )
 
         with patch.object(attack, "execute_with_context_async", new_callable=AsyncMock, return_value=mock_result):
+            message = Message.from_prompt(prompt="Custom prompt", role="user")
             result = await attack.execute_async(
                 objective="Test objective",
                 memory_labels={"test": "label"},
-                custom_prompt="Custom prompt",
+                next_message=message,
             )
 
         assert isinstance(result, CrescendoAttackResult)
@@ -1466,7 +1973,6 @@ class TestIntegrationScenarios:
     They simulate full attack flows including multiple turns, scoring, and decision-making.
     """
 
-    @pytest.mark.asyncio
     async def test_complete_successful_attack_scenario(
         self,
         mock_objective_target: MagicMock,
@@ -1489,7 +1995,8 @@ class TestIntegrationScenarios:
         )
 
         context = CrescendoAttackContext(
-            objective="Extract sensitive information",
+            params=AttackParameters(objective="Extract sensitive information"),
+            session=ConversationSession(),
         )
 
         # Set up mock responses for a 3-turn successful attack
@@ -1516,26 +2023,27 @@ class TestIntegrationScenarios:
         ]
 
         # Create scores that show progression toward the objective
-        # The increasing scores simulate the model becoming more compliant
+        # FloatScaleThresholdScorer returns true_false scores based on threshold comparison
+        # First two attempts fail (below threshold), third succeeds (above threshold)
         scores = [
             create_score(
-                score_type="float_scale",
-                score_value="0.3",
+                score_type="true_false",
+                score_value="false",
                 score_category=["objective"],
                 scorer_class="FloatScaleThresholdScorer",
             ),
             create_score(
-                score_type="float_scale",
-                score_value="0.6",
+                score_type="true_false",
+                score_value="false",
                 score_category=["objective"],
                 scorer_class="FloatScaleThresholdScorer",
             ),
             create_score(
-                score_type="float_scale",
-                score_value="0.9",
+                score_type="true_false",
+                score_value="true",
                 score_category=["objective"],
                 scorer_class="FloatScaleThresholdScorer",
-            ),  # Above threshold
+            ),  # Above threshold - objective achieved
         ]
 
         # Set up mock behavior to simulate the conversation flow
@@ -1559,29 +2067,30 @@ class TestIntegrationScenarios:
         # Mock the conversation manager to return an empty state (no prepended conversation)
         mock_conversation_state = ConversationState(turn_count=0)
 
-        with patch.object(
-            attack._conversation_manager, "update_conversation_state_async", return_value=mock_conversation_state
+        with (
+            patch.object(
+                attack._conversation_manager, "initialize_context_async", return_value=mock_conversation_state
+            ),
+            patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal),
         ):
-            with patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal):
-                with patch("pyrit.score.Scorer.score_response_async", new_callable=AsyncMock) as mock_score:
-                    mock_score.side_effect = [
-                        {"objective_scores": [scores[0]], "auxiliary_scores": []},
-                        {"objective_scores": [scores[1]], "auxiliary_scores": []},
-                        {"objective_scores": [scores[2]], "auxiliary_scores": []},
-                    ]
+            with patch("pyrit.score.Scorer.score_response_async", new_callable=AsyncMock) as mock_score:
+                mock_score.side_effect = [
+                    {"objective_scores": [scores[0]], "auxiliary_scores": []},
+                    {"objective_scores": [scores[1]], "auxiliary_scores": []},
+                    {"objective_scores": [scores[2]], "auxiliary_scores": []},
+                ]
 
-                    result = await attack.execute_with_context_async(context=context)
+                result = await attack.execute_with_context_async(context=context)
 
         # Verify the attack succeeded
         assert isinstance(result, CrescendoAttackResult)
         assert result.outcome == AttackOutcome.SUCCESS
         assert result.executed_turns == 3
         assert result.last_score is not None
-        assert result.last_score.get_value() == 0.9
+        assert result.last_score.get_value() is True  # Threshold met on final turn
         assert result.last_response is not None
         assert "sensitive data" in result.last_response.converted_value
 
-    @pytest.mark.asyncio
     async def test_attack_with_backtracking_scenario(
         self,
         mock_objective_target: MagicMock,
@@ -1607,7 +2116,8 @@ class TestIntegrationScenarios:
         )
 
         context = CrescendoAttackContext(
-            objective="Test with refusals",
+            params=AttackParameters(objective="Test with refusals"),
+            session=ConversationSession(),
         )
 
         # Set up responses
@@ -1648,20 +2158,20 @@ class TestIntegrationScenarios:
         # Mock the conversation manager to return an empty state
         mock_conversation_state = ConversationState(turn_count=0)
 
-        with patch.object(
-            attack._conversation_manager, "update_conversation_state_async", return_value=mock_conversation_state
+        with (
+            patch.object(
+                attack._conversation_manager, "initialize_context_async", return_value=mock_conversation_state
+            ),
+            patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, side_effect=refusal_checks),
         ):
-            with patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, side_effect=refusal_checks):
-                with patch.object(
-                    attack, "_backtrack_memory_async", new_callable=AsyncMock, return_value="new_conv_id"
-                ):
-                    with patch("pyrit.score.Scorer.score_response_async", new_callable=AsyncMock) as mock_score:
-                        mock_score.return_value = {
-                            "objective_scores": [success_objective_score],
-                            "auxiliary_scores": [],
-                        }
+            with patch.object(attack, "_backtrack_memory_async", new_callable=AsyncMock, return_value="new_conv_id"):
+                with patch("pyrit.score.Scorer.score_response_async", new_callable=AsyncMock) as mock_score:
+                    mock_score.return_value = {
+                        "objective_scores": [success_objective_score],
+                        "auxiliary_scores": [],
+                    }
 
-                        result = await attack.execute_with_context_async(context=context)
+                    result = await attack.execute_with_context_async(context=context)
 
         # Verify backtracking occurred as expected
         assert isinstance(result, CrescendoAttackResult)
@@ -1677,7 +2187,6 @@ class TestEdgeCases:
     and provides meaningful error messages when things go wrong.
     """
 
-    @pytest.mark.asyncio
     async def test_attack_with_empty_objective(
         self,
         mock_objective_target: MagicMock,
@@ -1689,12 +2198,11 @@ class TestEdgeCases:
             adversarial_chat=mock_adversarial_chat,
         )
 
-        context = CrescendoAttackContext(objective="")
+        context = CrescendoAttackContext(params=AttackParameters(objective=""))
 
         with pytest.raises(ValueError, match="Strategy context validation failed for CrescendoAttack"):
             await attack.execute_with_context_async(context=context)
 
-    @pytest.mark.asyncio
     async def test_attack_with_json_parsing_retry(
         self,
         mock_objective_target: MagicMock,
@@ -1730,7 +2238,6 @@ class TestEdgeCases:
         # Verify retry occurred - called at least twice due to first failure
         assert mock_prompt_normalizer.send_prompt_async.call_count >= 2
 
-    @pytest.mark.asyncio
     async def test_attack_handles_scoring_errors_gracefully(
         self,
         mock_objective_target: MagicMock,
@@ -1755,7 +2262,6 @@ class TestEdgeCases:
             with pytest.raises(RuntimeError, match="No objective scores returned"):
                 await attack._score_response_async(context=basic_context)
 
-    @pytest.mark.asyncio
     async def test_concurrent_context_isolation(
         self,
         mock_objective_target: MagicMock,
@@ -1774,15 +2280,15 @@ class TestEdgeCases:
 
         # Create two contexts that could be used concurrently
         # They have different objectives to ensure isolation
-        context1 = CrescendoAttackContext(objective="Objective 1")
-        context2 = CrescendoAttackContext(objective="Objective 2")
+        context1 = CrescendoAttackContext(params=AttackParameters(objective="Objective 1"))
+        context2 = CrescendoAttackContext(params=AttackParameters(objective="Objective 2"))
 
         # Mock conversation manager for both setups
         mock_state1 = ConversationState(turn_count=0)
         mock_state2 = ConversationState(turn_count=0)
 
         with patch.object(
-            attack._conversation_manager, "update_conversation_state_async", side_effect=[mock_state1, mock_state2]
+            attack._conversation_manager, "initialize_context_async", side_effect=[mock_state1, mock_state2]
         ):
             # Simulate concurrent setup - both contexts use the same attack instance
             await attack._setup_async(context=context1)
@@ -1795,7 +2301,6 @@ class TestEdgeCases:
         # Most importantly, they should have different conversation IDs
         assert context1.session.conversation_id != context2.session.conversation_id
 
-    @pytest.mark.asyncio
     async def test_execute_async_integration(
         self,
         mock_objective_target: MagicMock,
@@ -1822,26 +2327,27 @@ class TestEdgeCases:
         # Mock conversation state
         mock_conversation_state = ConversationState(turn_count=0)
 
-        with patch.object(
-            attack._conversation_manager, "update_conversation_state_async", return_value=mock_conversation_state
+        with (
+            patch.object(
+                attack._conversation_manager, "initialize_context_async", return_value=mock_conversation_state
+            ),
+            patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal_score),
+            patch(
+                "pyrit.score.Scorer.score_response_async",
+                new_callable=AsyncMock,
+                return_value={"objective_scores": [success_objective_score], "auxiliary_scores": []},
+            ),
         ):
-            with patch.object(attack, "_check_refusal_async", new_callable=AsyncMock, return_value=no_refusal_score):
-                with patch(
-                    "pyrit.score.Scorer.score_response_async",
-                    new_callable=AsyncMock,
-                    return_value={"objective_scores": [success_objective_score], "auxiliary_scores": []},
-                ):
-                    # Use the execute_async method with parameters
-                    result = await attack.execute_async(
-                        objective="Test objective",
-                        memory_labels={"test": "label"},
-                    )
+            # Use the execute_async method with parameters
+            result = await attack.execute_async(
+                objective="Test objective",
+                memory_labels={"test": "label"},
+            )
 
         assert isinstance(result, CrescendoAttackResult)
         assert result.outcome == AttackOutcome.SUCCESS
         assert result.objective == "Test objective"
 
-    @pytest.mark.asyncio
     async def test_execute_async_with_invalid_attack_params(
         self,
         mock_objective_target: MagicMock,
@@ -1855,8 +2361,8 @@ class TestEdgeCases:
             attack_adversarial_config=adversarial_config,
         )
 
-        # Test with unknown parameter - should raise TypeError
-        with pytest.raises(TypeError, match="got an unexpected keyword argument"):
+        # Test with unknown parameter - should raise ValueError
+        with pytest.raises(ValueError, match="does not accept parameters"):
             await attack.execute_async(
                 objective="Test objective",
                 unknown_param="should cause error",
@@ -1865,7 +2371,6 @@ class TestEdgeCases:
 
 @pytest.mark.usefixtures("patch_central_database")
 class TestCrescendoConversationTracking:
-    @pytest.mark.asyncio
     async def test_setup_tracks_adversarial_chat_conversation_id(
         self,
         mock_objective_target: MagicMock,
@@ -1877,11 +2382,9 @@ class TestCrescendoConversationTracking:
             attack_adversarial_config=AttackAdversarialConfig(target=mock_adversarial_chat),
         )
         with patch.object(
-            attack._conversation_manager, "update_conversation_state_async", new_callable=AsyncMock
+            attack._conversation_manager, "initialize_context_async", new_callable=AsyncMock
         ) as mock_update:
-            mock_update.return_value = ConversationState(
-                turn_count=0, last_user_message="Test message", last_assistant_message_scores=[]
-            )
+            mock_update.return_value = ConversationState(turn_count=0, last_assistant_message_scores=[])
             await attack._setup_async(context=basic_context)
 
             # Validate that the conversation ID is added to related_conversations
@@ -1890,3 +2393,73 @@ class TestCrescendoConversationTracking:
                 and ref.conversation_type == ConversationType.ADVERSARIAL
                 for ref in basic_context.related_conversations
             )
+
+
+@pytest.mark.usefixtures("patch_central_database")
+class TestCrescendoAdversarialIdentity:
+    """Tests for adversarial config in the Crescendo attack identity and inline system prompt."""
+
+    def test_get_attack_adversarial_config_returns_target_and_system_prompt(
+        self, mock_objective_target, mock_adversarial_chat, mock_objective_scorer
+    ):
+        attack = CrescendoTestHelper.create_attack(
+            objective_target=mock_objective_target,
+            adversarial_chat=mock_adversarial_chat,
+            objective_scorer=mock_objective_scorer,
+        )
+        config = attack.get_attack_adversarial_config()
+        assert config is not None
+        assert config.target is mock_adversarial_chat
+        assert config.system_prompt is attack._adversarial_chat_system_prompt_template
+        assert config.seed_prompt is None
+
+    def test_get_attack_adversarial_config_returns_none_without_target(
+        self, mock_objective_target, mock_adversarial_chat, mock_objective_scorer
+    ):
+        attack = CrescendoTestHelper.create_attack(
+            objective_target=mock_objective_target,
+            adversarial_chat=mock_adversarial_chat,
+            objective_scorer=mock_objective_scorer,
+        )
+        attack._adversarial_chat = None
+        assert attack.get_attack_adversarial_config() is None
+
+    def test_identifier_includes_adversarial_chat_child(
+        self, mock_objective_target, mock_adversarial_chat, mock_objective_scorer
+    ):
+        attack = CrescendoTestHelper.create_attack(
+            objective_target=mock_objective_target,
+            adversarial_chat=mock_adversarial_chat,
+            objective_scorer=mock_objective_scorer,
+        )
+        identifier = attack.get_identifier()
+        assert "adversarial_chat" in identifier.children
+        assert identifier.children["adversarial_chat"] == mock_adversarial_chat.get_identifier.return_value
+
+    def test_inline_system_prompt_string_resolved_and_in_identity(
+        self, mock_objective_target, mock_adversarial_chat, mock_objective_scorer
+    ):
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=AttackAdversarialConfig(
+                target=mock_adversarial_chat, system_prompt="custom crescendo persona"
+            ),
+            attack_scoring_config=AttackScoringConfig(objective_scorer=mock_objective_scorer),
+        )
+        assert attack._adversarial_chat_system_prompt_template.value == "custom crescendo persona"
+        assert attack.get_identifier().params["adversarial_system_prompt"] == "custom crescendo persona"
+
+    def test_inline_system_prompt_seedprompt_resolved(
+        self, mock_objective_target, mock_adversarial_chat, mock_objective_scorer
+    ):
+        seed = SeedPrompt(
+            value="persona {{ objective }} {{ max_turns }}",
+            data_type="text",
+            parameters=["objective", "max_turns"],
+        )
+        attack = CrescendoAttack(
+            objective_target=mock_objective_target,
+            attack_adversarial_config=AttackAdversarialConfig(target=mock_adversarial_chat, system_prompt=seed),
+            attack_scoring_config=AttackScoringConfig(objective_scorer=mock_objective_scorer),
+        )
+        assert attack._adversarial_chat_system_prompt_template is seed

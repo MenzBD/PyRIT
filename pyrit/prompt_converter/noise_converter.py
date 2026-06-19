@@ -4,13 +4,12 @@
 import logging
 import pathlib
 import textwrap
-from typing import Optional
 
 from pyrit.common.apply_defaults import REQUIRED_VALUE, apply_defaults
-from pyrit.common.path import DATASETS_PATH
-from pyrit.models import SeedPrompt
-from pyrit.prompt_converter import LLMGenericTextConverter
-from pyrit.prompt_target import PromptChatTarget
+from pyrit.common.path import CONVERTER_SEED_PROMPT_PATH
+from pyrit.models import ComponentIdentifier, SeedPrompt
+from pyrit.prompt_converter.llm_generic_text_converter import LLMGenericTextConverter
+from pyrit.prompt_target import PromptTarget
 
 logger = logging.getLogger(__name__)
 
@@ -19,23 +18,23 @@ class NoiseConverter(LLMGenericTextConverter):
     """
     Injects noise errors into a conversation using an LLM.
 
-    An existing ``PromptChatTarget`` is used to perform the conversion (like Azure OpenAI).
+    An existing ``PromptTarget`` is used to perform the conversion (like Azure OpenAI).
     """
 
     @apply_defaults
     def __init__(
         self,
         *,
-        converter_target: PromptChatTarget = REQUIRED_VALUE,  # type: ignore[assignment]
-        noise: Optional[str] = None,
+        converter_target: PromptTarget = REQUIRED_VALUE,  # type: ignore[ty:invalid-parameter-default]
+        noise: str | None = None,
         number_errors: int = 5,
-        prompt_template: Optional[SeedPrompt] = None,
-    ):
+        prompt_template: SeedPrompt | None = None,
+    ) -> None:
         """
-        Initializes the converter with the specified parameters.
+        Initialize the converter with the specified parameters.
 
         Args:
-            converter_target (PromptChatTarget): The endpoint that converts the prompt.
+            converter_target (PromptTarget): The endpoint that converts the prompt.
                 Can be omitted if a default has been configured via PyRIT initialization.
             noise (str): The noise to inject. Grammar error, delete random letter, insert random space, etc.
             number_errors (int): The number of errors to inject.
@@ -45,7 +44,7 @@ class NoiseConverter(LLMGenericTextConverter):
         prompt_template = (
             prompt_template
             if prompt_template
-            else SeedPrompt.from_yaml_file(pathlib.Path(DATASETS_PATH) / "prompt_converters" / "noise_converter.yaml")
+            else SeedPrompt.from_yaml_file(pathlib.Path(CONVERTER_SEED_PROMPT_PATH) / "noise_converter.yaml")
         )
 
         if not noise:
@@ -59,4 +58,21 @@ class NoiseConverter(LLMGenericTextConverter):
             system_prompt_template=prompt_template,
             noise=noise,
             number_errors=str(number_errors),
+        )
+        self._noise = noise
+        self._number_errors = number_errors
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the converter identifier with noise parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this converter.
+        """
+        return self._create_identifier(
+            params={
+                "noise": self._noise,
+                "number_errors": self._number_errors,
+            },
+            converter_target=self._converter_target.get_identifier(),
         )

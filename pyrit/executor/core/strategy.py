@@ -12,18 +12,31 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, AsyncIterator, Dict, Generic, MutableMapping, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pyrit.common import default_values
 from pyrit.common.logger import logger
+from pyrit.exceptions import clear_execution_context, get_execution_context
+from pyrit.exceptions.retry_collector import (
+    RetryCollector,
+    clear_retry_collector,
+    set_retry_collector,
+)
 from pyrit.models import StrategyResultT
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, MutableMapping
 
 StrategyContextT = TypeVar("StrategyContextT", bound="StrategyContext")
 
 
+class _StrategyRuntimeError(RuntimeError):
+    """RuntimeError subclass for strategy execution failures."""
+
+
 @dataclass
-class StrategyContext(ABC):
-    """Base class for all strategy contexts"""
+class StrategyContext(ABC):  # noqa: B024
+    """Base class for all strategy contexts."""
 
     def duplicate(self: StrategyContextT) -> StrategyContextT:
         """
@@ -72,10 +85,10 @@ class StrategyEventData(Generic[StrategyContextT, StrategyResultT]):
 
     # Context and result of the strategy
     context: StrategyContextT
-    result: Optional[StrategyResultT] = None
+    result: StrategyResultT | None = None
 
     # Optional error if the event is related to an error
-    error: Optional[Exception] = None
+    error: Exception | None = None
 
 
 class StrategyEventHandler(ABC, Generic[StrategyContextT, StrategyResultT]):
@@ -88,17 +101,24 @@ class StrategyEventHandler(ABC, Generic[StrategyContextT, StrategyResultT]):
     """
 
     @abstractmethod
-    async def on_event(self, event_data: StrategyEventData[StrategyContextT, StrategyResultT]) -> None:
+    async def on_event_async(self, event_data: StrategyEventData[StrategyContextT, StrategyResultT]) -> None:
         """
         Handle a strategy event.
 
         Args:
             event_data: Data about the event that occurred.
         """
-        pass
 
 
-class StrategyLogAdapter(logging.LoggerAdapter):
+# ``logging.LoggerAdapter`` only became subscriptable at runtime on Python 3.11, but PyRIT
+# supports 3.10. Parameterize it for type checkers only and use the bare class at runtime.
+if TYPE_CHECKING:
+    _LoggerAdapter = logging.LoggerAdapter[logging.Logger]
+else:
+    _LoggerAdapter = logging.LoggerAdapter
+
+
+class StrategyLogAdapter(_LoggerAdapter):
     """
     Custom logger adapter that adds strategy information to log messages.
     """
@@ -107,7 +127,12 @@ class StrategyLogAdapter(logging.LoggerAdapter):
     _STRATEGY_ID_KEY = "strategy_id"
 
     def process(self, msg: Any, kwargs: MutableMapping[str, Any]) -> tuple[str, MutableMapping[str, Any]]:
-        """Add strategy context to each log message."""
+        """
+        Add strategy context to each log message.
+
+        Returns:
+            tuple: The modified log message and keyword arguments.
+        """
         if not self.extra:
             return msg, kwargs
 
@@ -140,22 +165,21 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         self,
         *,
         context_type: type[StrategyContextT],
-        event_handler: Optional[StrategyEventHandler[StrategyContextT, StrategyResultT]] = None,
+        event_handler: StrategyEventHandler[StrategyContextT, StrategyResultT] | None = None,
         logger: logging.Logger = logger,
-    ):
+    ) -> None:
         """
         Initialize the strategy with a context type and logger.
 
         Args:
             context_type (type[StrategyContextT]): The type of context this strategy will use.
-            event_handler (Optional[StrategyEventHandler[StrategyContextT, StrategyResultT]]): An optional
+            event_handler (StrategyEventHandler[StrategyContextT, StrategyResultT] | None): An optional
                 event handler for strategy events.
             logger (logging.Logger): The logger to use for this strategy.
         """
-
         self._id = uuid.uuid4()
         self._context_type = context_type
-        self._event_handlers: Dict[str, StrategyEventHandler[StrategyContextT, StrategyResultT]] = {}
+        self._event_handlers: dict[str, StrategyEventHandler[StrategyContextT, StrategyResultT]] = {}
 
         if event_handler is not None:
             self._register_event_handler(event_handler)
@@ -167,16 +191,9 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
                 StrategyLogAdapter._STRATEGY_ID_KEY: str(self._id)[:8],
             },
         )
-        self._memory_labels: Dict[str, str] = ast.literal_eval(
+        self._memory_labels: dict[str, str] = ast.literal_eval(
             default_values.get_non_required_value(env_var_name="GLOBAL_MEMORY_LABELS") or "{}"
         )
-
-    def get_identifier(self):
-        return {
-            "__type__": self.__class__.__name__,
-            "__module__": self.__class__.__module__,
-            "id": str(self._id),
-        }
 
     def _register_event_handler(self, event_handler: StrategyEventHandler[StrategyContextT, StrategyResultT]) -> None:
         """
@@ -200,19 +217,17 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         Raises:
             Exception: If the context is invalid for this strategy.
         """
-        pass
 
     @abstractmethod
     async def _setup_async(self, *, context: StrategyContextT) -> None:
         """
-        Setup phase before executing the strategy.
+        Set up the phase before executing the strategy.
         This method should be implemented by subclasses to prepare any necessary state or resources.
         This method is guaranteed to be called before the strategy execution and after context validation.
 
         Args:
             context (StrategyContextT): The context for the strategy.
         """
-        pass
 
     @abstractmethod
     async def _perform_async(self, *, context: StrategyContextT) -> StrategyResultT:
@@ -226,7 +241,6 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         Returns:
             StrategyResultT: The result of the strategy execution.
         """
-        pass
 
     @abstractmethod
     async def _teardown_async(self, *, context: StrategyContextT) -> None:
@@ -238,15 +252,14 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         Args:
             context (StrategyContextT): The context for the strategy.
         """
-        pass
 
-    async def _handle_event(
+    async def _handle_event_async(
         self,
         *,
         event: StrategyEvent,
         context: StrategyContextT,
-        result: Optional[StrategyResultT] = None,
-        error: Optional[Exception] = None,
+        result: StrategyResultT | None = None,
+        error: Exception | None = None,
     ) -> None:
         """
         Handle a strategy event by notifying all registered event handlers.
@@ -254,8 +267,8 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         Args:
             event (StrategyEvent): The event that occurred.
             context (StrategyContextT): The context for the strategy.
-            result (Optional[StrategyResultT]): The result of the strategy execution, if applicable.
-            error (Optional[Exception]): An error that occurred during execution, if applicable.
+            result (StrategyResultT | None): The result of the strategy execution, if applicable.
+            error (Exception | None): An error that occurred during execution, if applicable.
         """
         event_data = StrategyEventData(
             event=event,
@@ -268,13 +281,15 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
 
         # Dispatch events to all handlers in parallel
         if self._event_handlers:
-            tasks = [asyncio.create_task(handler.on_event(event_data)) for handler in self._event_handlers.values()]
+            tasks = [
+                asyncio.create_task(handler.on_event_async(event_data)) for handler in self._event_handlers.values()
+            ]
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @asynccontextmanager
-    async def _execution_context(self, context: StrategyContextT) -> AsyncIterator[None]:
+    async def _execution_context_async(self, context: StrategyContextT) -> AsyncIterator[None]:
         """
-        Manages the complete lifecycle of a strategy execution as an async context manager.
+        Manage the complete lifecycle of a strategy execution as an async context manager.
 
         This method provides a context manager that ensures proper setup and teardown
         of strategy resources, regardless of whether the strategy completes successfully
@@ -286,20 +301,19 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         Yields:
             None: Control is yielded back to the caller after setup is complete.
         """
-
         try:
             # Notify pre-setup event
-            await self._handle_event(event=StrategyEvent.ON_PRE_SETUP, context=context)
+            await self._handle_event_async(event=StrategyEvent.ON_PRE_SETUP, context=context)
             await self._setup_async(context=context)
             # Notify post-setup event
-            await self._handle_event(event=StrategyEvent.ON_POST_SETUP, context=context)
+            await self._handle_event_async(event=StrategyEvent.ON_POST_SETUP, context=context)
             yield
         finally:
             # Notify pre-teardown event
-            await self._handle_event(event=StrategyEvent.ON_PRE_TEARDOWN, context=context)
+            await self._handle_event_async(event=StrategyEvent.ON_PRE_TEARDOWN, context=context)
             await self._teardown_async(context=context)
             # Notify post-teardown event
-            await self._handle_event(event=StrategyEvent.ON_POST_TEARDOWN, context=context)
+            await self._handle_event_async(event=StrategyEvent.ON_POST_TEARDOWN, context=context)
 
     async def execute_with_context_async(self, *, context: StrategyContextT) -> StrategyResultT:
         """
@@ -321,30 +335,72 @@ class Strategy(ABC, Generic[StrategyContextT, StrategyResultT]):
         # This is a critical step to ensure the context is suitable for the strategy
         try:
             # Notify pre-validation event
-            await self._handle_event(event=StrategyEvent.ON_PRE_VALIDATE, context=context)
+            await self._handle_event_async(event=StrategyEvent.ON_PRE_VALIDATE, context=context)
             self._validate_context(context=context)
             # Notify post-validation event
-            await self._handle_event(event=StrategyEvent.ON_POST_VALIDATE, context=context)
+            await self._handle_event_async(event=StrategyEvent.ON_POST_VALIDATE, context=context)
         except Exception as e:
             raise ValueError(f"Strategy context validation failed for {self.__class__.__name__}: {str(e)}") from e
 
         # Execution with lifecycle management
         # This uses an async context manager to ensure setup and teardown are handled correctly
         try:
-            async with self._execution_context(context):
-                await self._handle_event(event=StrategyEvent.ON_PRE_EXECUTE, context=context)
+            async with self._execution_context_async(context):
+                await self._handle_event_async(event=StrategyEvent.ON_PRE_EXECUTE, context=context)
+
+                # Set up RetryCollector in the parent task so it is visible to
+                # Tenacity callbacks that fire during _perform_async.  Event
+                # handlers run in child tasks (asyncio.create_task) which
+                # inherit a *copy* of the parent's ContextVar — setting the
+                # collector here ensures both the execution path and the event
+                # handlers can see it.
+                collector = RetryCollector()
+                set_retry_collector(collector)
+
                 result = await self._perform_async(context=context)
-                await self._handle_event(event=StrategyEvent.ON_POST_EXECUTE, context=context, result=result)
+                await self._handle_event_async(event=StrategyEvent.ON_POST_EXECUTE, context=context, result=result)
+                clear_retry_collector()
                 return result
         except Exception as e:
             # Notify error event
-            await self._handle_event(event=StrategyEvent.ON_ERROR, context=context, error=e)
-            # Raise a specific execution error
-            raise RuntimeError(f"Strategy execution failed for {self.__class__.__name__}: {str(e)}") from e
+            await self._handle_event_async(event=StrategyEvent.ON_ERROR, context=context, error=e)
+            clear_retry_collector()
 
-    async def execute_async(self, **kwargs) -> StrategyResultT:
+            # Build enhanced error message with execution context if available
+            # Note: The context is preserved on exception by ExecutionContextManager
+            exec_context = get_execution_context()
+            if exec_context:
+                error_details = exec_context.get_exception_details()
+
+                # Extract the root cause exception for better diagnostics
+                root_cause: BaseException = e
+                while root_cause.__cause__ is not None:
+                    root_cause = root_cause.__cause__
+
+                # Include root cause type and message if different from the immediate exception
+                if root_cause is not e:
+                    root_cause_info = f"\n\nRoot cause: {type(root_cause).__name__}: {str(root_cause)}"
+                else:
+                    root_cause_info = ""
+
+                error_message = (
+                    f"Strategy execution failed for {exec_context.component_role.value} "
+                    f"in {self.__class__.__name__}: {str(e)}{root_cause_info}\n\nDetails:\n{error_details}"
+                )
+                # Clear the context now that we've read it
+                clear_execution_context()
+            else:
+                error_message = f"Strategy execution failed for {self.__class__.__name__}: {str(e)}"
+
+            runtime_error = _StrategyRuntimeError(error_message)
+            raise runtime_error from e
+
+    async def execute_async(self, **kwargs: Any) -> StrategyResultT:
         """
         Execute the strategy asynchronously with the given keyword arguments.
+
+        Returns:
+            StrategyResultT: The result of the strategy execution.
         """
         context = self._context_type(**kwargs)
         return await self.execute_with_context_async(context=context)

@@ -1,11 +1,13 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from typing import Generator
+from collections.abc import Generator
 
 from sqlalchemy import inspect
 
 from pyrit.memory import MemoryInterface, SQLiteMemory
+from pyrit.models import ComponentIdentifier, Message, MessagePiece
+from pyrit.prompt_target import PromptTarget, TargetCapabilities, TargetConfiguration, limit_requests_per_minute
 
 
 def get_memory_interface() -> Generator[MemoryInterface, None, None]:
@@ -30,3 +32,58 @@ def get_sqlite_memory() -> Generator[SQLiteMemory, None, None]:
 
     yield sqlite_memory
     sqlite_memory.dispose_engine()
+
+
+class MockPromptTarget(PromptTarget):
+    _DEFAULT_CONFIGURATION: TargetConfiguration = TargetConfiguration(
+        capabilities=TargetCapabilities(
+            supports_multi_turn=True,
+            supports_multi_message_pieces=True,
+            supports_system_prompt=True,
+            supports_editable_history=True,
+        )
+    )
+
+    prompt_sent: list[str]
+
+    def __init__(self, *, id=None, rpm=None) -> None:  # noqa: A002
+        super().__init__(max_requests_per_minute=rpm)
+        self.id = id
+        self.prompt_sent = []
+
+    def set_system_prompt(
+        self,
+        *,
+        system_prompt: str,
+        conversation_id: str,
+        attack_identifier: ComponentIdentifier | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> None:
+        self.system_prompt = system_prompt
+        if self._memory:
+            self._memory.add_message_to_memory(
+                request=MessagePiece(
+                    role="system",
+                    original_value=system_prompt,
+                    converted_value=system_prompt,
+                    conversation_id=conversation_id,
+                ).to_message()
+            )
+
+    @limit_requests_per_minute
+    async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
+        message = normalized_conversation[-1]
+        self.prompt_sent.append(message.get_value())
+
+        return [
+            MessagePiece(
+                role="assistant",
+                original_value="default",
+                conversation_id=message.message_pieces[0].conversation_id,
+            ).to_message()
+        ]
+
+    def _validate_request(self, *, normalized_conversation: list[Message]) -> None:
+        """
+        Validates the provided message
+        """

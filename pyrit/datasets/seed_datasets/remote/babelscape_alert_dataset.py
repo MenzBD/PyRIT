@@ -1,0 +1,132 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+import logging
+from typing import TYPE_CHECKING, Literal
+
+from typing_extensions import override
+
+from pyrit.datasets.seed_datasets.remote.remote_dataset_loader import (
+    _RemoteDatasetLoader,
+)
+from pyrit.models import Modality, SeedDataset, SeedPrompt
+
+if TYPE_CHECKING:
+    from pyrit.models.seeds.seed_group import SeedUnion
+
+logger = logging.getLogger(__name__)
+
+
+class _BabelscapeAlertDataset(_RemoteDatasetLoader):
+    """
+    Loader for the Babelscape/ALERT dataset.
+
+    This dataset consists of two categories:
+    - 'alert': 15k red teaming prompts
+    - 'alert_adversarial': 30k adversarial red teaming prompts
+
+    Reference: [@tedeschi2024alert]
+    """
+
+    _AUTHORS = [
+        "Simone Tedeschi",
+        "Felix Friedrich",
+        "Patrick Schramowski",
+        "Kristian Kersting",
+        "Roberto Navigli",
+        "Huu Nguyen",
+        "Bo Li",
+    ]
+
+    _GROUPS = [
+        "Sapienza University of Rome",
+        "Babelscape",
+        "TU Darmstadt",
+        "Hessian.AI",
+        "DFKI",
+        "Ontocord.AI",
+        "University of Chicago",
+        "University of Illinois Urbana-Champaign",
+    ]
+
+    # Metadata
+    modalities: tuple[Modality, ...] = (Modality.TEXT,)
+    size: str = "huge"  # 30968 prompts (default config)
+    tags: frozenset[str] = frozenset({"default", "safety", "jailbreak"})
+
+    def __init__(
+        self,
+        *,
+        source: str = "Babelscape/ALERT",
+        category: Literal["alert", "alert_adversarial"] | None = "alert_adversarial",
+    ) -> None:
+        """
+        Initialize the Babelscape ALERT dataset loader.
+
+        Args:
+            source: HuggingFace dataset identifier. Defaults to "Babelscape/ALERT".
+            category: The dataset category. "alert", "alert_adversarial", or None for both.
+                Defaults to "alert_adversarial".
+
+        Raises:
+            ValueError: If an invalid category is provided.
+        """
+        self.source = source
+        self.category = category
+
+        if category is not None and category not in ["alert_adversarial", "alert"]:
+            raise ValueError(f"Invalid Parameter: {category}. Expected 'alert_adversarial', 'alert', or None")
+
+    @property
+    @override
+    def dataset_name(self) -> str:
+        """Return the dataset name."""
+        return "babelscape_alert"
+
+    @override
+    async def fetch_dataset_async(self, *, cache: bool = True) -> SeedDataset:
+        """
+        Fetch Babelscape ALERT dataset and return as SeedDataset.
+
+        Args:
+            cache: Whether to cache the fetched dataset. Defaults to True.
+
+        Returns:
+            SeedDataset: A SeedDataset containing the ALERT prompts.
+        """
+        logger.info(f"Loading Babelscape ALERT dataset from {self.source}")
+
+        # Determine which categories to load
+        data_categories = ["alert_adversarial", "alert"] if self.category is None else [self.category]
+
+        prompts: list[tuple[str, str]] = []
+        for category_name in data_categories:
+            data = await self._fetch_from_huggingface_async(
+                dataset_name=self.source,
+                config=category_name,
+                split="test",
+                cache=cache,
+            )
+            prompts.extend((item["prompt"], item["category"]) for item in data)
+
+        seed_prompts: list[SeedUnion] = [
+            SeedPrompt(
+                value=prompt,
+                harm_categories=[category],
+                data_type="text",
+                dataset_name=self.dataset_name,
+                description=(
+                    "ALERT by Babelscape is a dataset that consists of two different categories, "
+                    "'alert' with 15k red teaming prompts, and 'alert_adversarial' with 30k adversarial "
+                    "red teaming prompts."
+                ),
+                source=f"https://huggingface.co/datasets/{self.source}",
+                authors=self._AUTHORS,
+                groups=self._GROUPS,
+            )
+            for prompt, category in prompts
+        ]
+
+        logger.info(f"Successfully loaded {len(seed_prompts)} prompts from Babelscape Alert dataset")
+
+        return SeedDataset(seeds=seed_prompts, dataset_name=self.dataset_name)

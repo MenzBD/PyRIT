@@ -3,7 +3,6 @@
 
 import logging
 from enum import Enum
-from typing import Optional
 from urllib.parse import urlparse
 
 from azure.core.exceptions import ClientAuthenticationError
@@ -12,8 +11,11 @@ from azure.storage.blob.aio import ContainerClient as AsyncContainerClient
 
 from pyrit.auth import AzureStorageAuth
 from pyrit.common import default_values
-from pyrit.models import Message, construct_response_from_request
-from pyrit.prompt_target import PromptTarget, limit_requests_per_minute
+from pyrit.models import ComponentIdentifier, Message, construct_response_from_request
+from pyrit.prompt_target.common.prompt_target import PromptTarget
+from pyrit.prompt_target.common.target_capabilities import TargetCapabilities
+from pyrit.prompt_target.common.target_configuration import TargetConfiguration
+from pyrit.prompt_target.common.utils import limit_requests_per_minute
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 class SupportedContentType(Enum):
     """
     All supported content types for uploading blobs to provided storage account container.
-    See all options here: https://www.iana.org/assignments/media-types/media-types.xhtml
+    See all options here: https://www.iana.org/assignments/media-types/media-types.xhtml.
     """
 
     PLAIN_TEXT = "text/plain"
@@ -47,30 +49,80 @@ class AzureBlobStorageTarget(PromptTarget):
     AZURE_STORAGE_CONTAINER_ENVIRONMENT_VARIABLE: str = "AZURE_STORAGE_ACCOUNT_CONTAINER_URL"
     SAS_TOKEN_ENVIRONMENT_VARIABLE: str = "AZURE_STORAGE_ACCOUNT_SAS_TOKEN"
 
+    _DEFAULT_CONFIGURATION: TargetConfiguration = TargetConfiguration(
+        capabilities=TargetCapabilities(
+            input_modalities=frozenset(
+                {
+                    frozenset(["text"]),
+                    frozenset(["url"]),
+                }
+            ),
+            output_modalities=frozenset(
+                {
+                    frozenset(["url"]),
+                }
+            ),
+        )
+    )
+
     def __init__(
         self,
         *,
-        container_url: Optional[str] = None,
-        sas_token: Optional[str] = None,
+        container_url: str | None = None,
+        sas_token: str | None = None,
         blob_content_type: SupportedContentType = SupportedContentType.PLAIN_TEXT,
-        max_requests_per_minute: Optional[int] = None,
+        max_requests_per_minute: int | None = None,
+        custom_configuration: TargetConfiguration | None = None,
     ) -> None:
+        """
+        Initialize the Azure Blob Storage target.
 
+        Args:
+            container_url (str, Optional): The Azure Storage container URL.
+                Defaults to the AZURE_STORAGE_ACCOUNT_CONTAINER_URL environment variable.
+            sas_token (str, Optional): The SAS token for authentication.
+                Defaults to the AZURE_STORAGE_ACCOUNT_SAS_TOKEN environment variable.
+            blob_content_type (SupportedContentType): The content type for blobs.
+                Defaults to PLAIN_TEXT.
+            max_requests_per_minute (int, Optional): Maximum number of requests per minute.
+            custom_configuration (TargetConfiguration, Optional): Override the default configuration for
+                this target instance. Defaults to None.
+        """
         self._blob_content_type: str = blob_content_type.value
 
         self._container_url: str = default_values.get_required_value(
             env_var_name=self.AZURE_STORAGE_CONTAINER_ENVIRONMENT_VARIABLE, passed_value=container_url
         )
 
-        self._sas_token = sas_token
-        self._client_async: AsyncContainerClient = None
+        self._sas_token: str | None = sas_token
+        self._client_async: AsyncContainerClient | None = None
 
-        super().__init__(endpoint=self._container_url, max_requests_per_minute=max_requests_per_minute)
+        super().__init__(
+            endpoint=self._container_url,
+            max_requests_per_minute=max_requests_per_minute,
+            custom_configuration=custom_configuration,
+        )
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier with Azure Blob Storage-specific parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this target instance.
+        """
+        return self._create_identifier(
+            params={
+                "container_url": self._container_url,
+                "blob_content_type": self._blob_content_type,
+            },
+        )
 
     async def _create_container_client_async(self) -> None:
-        """Creates an asynchronous ContainerClient for Azure Storage. If a SAS token is provided via the
+        """
+        Create an asynchronous ContainerClient for Azure Storage. If a SAS token is provided via the
         AZURE_STORAGE_ACCOUNT_SAS_TOKEN environment variable or the init sas_token parameter, it will be used
-        for authentication. Otherwise, a delegation SAS token will be created using Entra ID authentication."""
+        for authentication. Otherwise, a delegation SAS token will be created using Entra ID authentication.
+        """
         container_url, _ = self._parse_url()
         try:
             sas_token: str = default_values.get_required_value(
@@ -79,7 +131,7 @@ class AzureBlobStorageTarget(PromptTarget):
             logger.info("Using SAS token from environment variable or passed parameter.")
         except ValueError:
             logger.info("SAS token not provided. Creating a delegation SAS token using Entra ID authentication.")
-            sas_token = await AzureStorageAuth.get_sas_token(container_url)
+            sas_token = await AzureStorageAuth.get_sas_token_async(container_url)
         self._client_async = AsyncContainerClient.from_container_url(
             container_url=container_url,
             credential=sas_token,
@@ -93,8 +145,10 @@ class AzureBlobStorageTarget(PromptTarget):
             file_name (str): File name to assign to uploaded blob.
             data (bytes): Byte representation of content to upload to container.
             content_type (str): Content type to upload.
-        """
 
+        Raises:
+            RuntimeError: If blob storage client is not initialized.
+        """
         content_settings = ContentSettings(content_type=f"{content_type}")
         logger.info(msg="\nUploading to Azure Storage as blob:\n\t" + file_name)
 
@@ -106,6 +160,8 @@ class AzureBlobStorageTarget(PromptTarget):
         # If not, the file will be put in the root of the container.
         blob_path = f"{blob_prefix}/{file_name}" if blob_prefix else file_name
         try:
+            if self._client_async is None:
+                raise RuntimeError("Blob storage client not initialized")
             blob_client = self._client_async.get_blob_client(blob=blob_path)
             if await blob_client.exists():
                 logger.info(msg=f"Blob {blob_path} already exists. Deleting it before uploading a new version.")
@@ -116,17 +172,21 @@ class AzureBlobStorageTarget(PromptTarget):
             if isinstance(exc, ClientAuthenticationError):
                 logger.exception(
                     msg="Authentication failed. Please check that the container existence in the "
-                    + "Azure Storage Account and ensure the validity of the provided SAS token. If you "
-                    + "haven't set the SAS token as an environment variable use `az login` to "
-                    + "enable delegation-based SAS authentication to connect to the storage account"
+                    "Azure Storage Account and ensure the validity of the provided SAS token. If you "
+                    "haven't set the SAS token as an environment variable use `az login` to "
+                    "enable delegation-based SAS authentication to connect to the storage account"
                 )
                 raise
-            else:
-                logger.exception(msg=f"An unexpected error occurred: {exc}")
-                raise
+            logger.exception(msg=f"An unexpected error occurred: {exc}")
+            raise
 
-    def _parse_url(self):
-        """Parses the Azure Storage Blob URL to extract components."""
+    def _parse_url(self) -> tuple[str, str]:
+        """
+        Parse the Azure Storage Blob URL to extract components.
+
+        Returns:
+            tuple: A tuple containing the container URL and blob prefix.
+        """
         parsed_url = urlparse(self._container_url)
         path_parts = parsed_url.path.split("/")
         container_name = path_parts[1]
@@ -135,20 +195,20 @@ class AzureBlobStorageTarget(PromptTarget):
         return container_url, blob_prefix
 
     @limit_requests_per_minute
-    async def send_prompt_async(self, *, message: Message) -> Message:
+    async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
         """
         (Async) Sends prompt to target, which creates a file and uploads it as a blob
         to the provided storage container.
 
         Args:
-            normalized_prompt (str): A normalized prompt to be sent to the prompt target.
-            conversation_id (str): The ID of the conversation.
-            normalizer_id (str): ID provided by the prompt normalizer.
+            normalized_conversation (list[Message]): The full conversation
+                (history + current message) after running the normalization
+                pipeline. The current message is the last element.
 
         Returns:
-            blob_url (str): The Blob URL of the created blob within the provided storage container.
+            list[Message]: A list containing the response with the Blob URL.
         """
-        self._validate_request(message=message)
+        message = normalized_conversation[-1]
         request = message.message_pieces[0]
 
         # default file name is <conversation_id>.txt, but can be overridden by prompt metadata
@@ -165,19 +225,4 @@ class AzureBlobStorageTarget(PromptTarget):
             request=request, response_text_pieces=[blob_url], response_type="url"
         )
 
-        return response
-
-    def _validate_request(self, *, message: Message) -> None:
-        n_pieces = len(message.message_pieces)
-        if n_pieces != 1:
-            raise ValueError(f"This target only supports a single message piece. Received {n_pieces} pieces")
-
-        piece_type = message.message_pieces[0].converted_value_data_type
-        if piece_type not in ["text", "url"]:
-            raise ValueError(f"This target only supports text and url prompt input. Received: {piece_type}.")
-
-        request = message.message_pieces[0]
-        messages = self._memory.get_chat_messages_with_conversation_id(conversation_id=request.conversation_id)
-
-        if len(messages) > 0:
-            raise ValueError("This target only supports a single turn conversation.")
+        return [response]

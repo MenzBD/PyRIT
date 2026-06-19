@@ -1,17 +1,22 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from typing import Optional
 
-from pyrit.models import Score
+from pyrit.models import ComponentIdentifier, Score
 from pyrit.score.float_scale.float_scale_score_aggregator import (
     FloatScaleScoreAggregator,
     FloatScaleScorerAllCategories,
     FloatScaleScorerByCategory,
 )
 
+# Reusable ComponentIdentifier for tests
+_TEST_SCORER_ID = ComponentIdentifier(
+    class_name="UnitTestScorer",
+    class_module="tests.unit.score",
+)
 
-def _mk_score(val: float, *, category: Optional[list[str]] = None, prr_id: str = "1", rationale: str = "") -> Score:
+
+def _mk_score(val: float, *, category: list[str] | None = None, prr_id: str = "1", rationale: str = "") -> Score:
     """Helper to create a float scale score."""
     return Score(
         score_value=str(val),
@@ -21,7 +26,7 @@ def _mk_score(val: float, *, category: Optional[list[str]] = None, prr_id: str =
         score_rationale=rationale,
         score_metadata=None,
         message_piece_id=prr_id,
-        scorer_class_identifier={"__type__": "UnitTestScorer"},
+        scorer_class_identifier=_TEST_SCORER_ID,
         objective=None,
     )
 
@@ -311,3 +316,52 @@ def test_values_clamped_to_range():
 
     assert results[0].value >= 0.0
     assert results[0].value <= 1.0
+
+
+# Tests for raise_on_empty behavior
+def test_max_raise_on_empty_with_scores():
+    """Test that MAX_RAISE_ON_EMPTY works normally when scores are present."""
+    scores = [_mk_score(0.3, category=["test"]), _mk_score(0.7, category=["test"])]
+    results = FloatScaleScoreAggregator.MAX_RAISE_ON_EMPTY(scores)
+    assert len(results) == 1
+    assert results[0].value == 0.7
+
+
+def test_max_raise_on_empty_with_no_scores():
+    """Test that MAX_RAISE_ON_EMPTY raises ValueError when no scores are present."""
+    import pytest
+
+    with pytest.raises(ValueError, match="No scores available for aggregation"):
+        FloatScaleScoreAggregator.MAX_RAISE_ON_EMPTY([])
+
+
+def test_min_raise_on_empty_with_scores():
+    """Test that MIN_RAISE_ON_EMPTY works normally when scores are present."""
+    scores = [_mk_score(0.3, category=["test"]), _mk_score(0.7, category=["test"])]
+    results = FloatScaleScoreAggregator.MIN_RAISE_ON_EMPTY(scores)
+    assert len(results) == 1
+    assert results[0].value == 0.3
+
+
+def test_min_raise_on_empty_with_no_scores():
+    """Test that MIN_RAISE_ON_EMPTY raises ValueError when no scores are present."""
+    import pytest
+
+    with pytest.raises(ValueError, match="No scores available for aggregation"):
+        FloatScaleScoreAggregator.MIN_RAISE_ON_EMPTY([])
+
+
+def test_average_raise_on_empty_with_scores():
+    """Test that AVERAGE_RAISE_ON_EMPTY works normally when scores are present."""
+    scores = [_mk_score(0.2, category=["test"]), _mk_score(0.4, category=["test"]), _mk_score(0.6, category=["test"])]
+    results = FloatScaleScoreAggregator.AVERAGE_RAISE_ON_EMPTY(scores)
+    assert len(results) == 1
+    assert results[0].value == 0.4
+
+
+def test_average_raise_on_empty_with_no_scores():
+    """Test that AVERAGE_RAISE_ON_EMPTY raises ValueError when no scores are present."""
+    import pytest
+
+    with pytest.raises(ValueError, match="No scores available for aggregation"):
+        FloatScaleScoreAggregator.AVERAGE_RAISE_ON_EMPTY([])

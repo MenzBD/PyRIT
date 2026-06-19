@@ -7,7 +7,7 @@ import logging
 import ecoji
 
 from pyrit.models import PromptDataType
-from pyrit.prompt_converter import ConverterResult, PromptConverter
+from pyrit.prompt_converter.prompt_converter import ConverterResult, PromptConverter
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +20,11 @@ class EcojiConverter(PromptConverter):
     See https://ecoji.io/ for more details.
     """
 
+    SUPPORTED_INPUT_TYPES = ("text",)
+    SUPPORTED_OUTPUT_TYPES = ("text",)
+
     def __init__(self) -> None:
         """Initialize the Ecoji converter."""
-        pass
 
     async def convert_async(self, *, prompt: str, input_type: PromptDataType = "text") -> ConverterResult:
         """
@@ -61,9 +63,3 @@ class EcojiConverter(PromptConverter):
         ecoji.encode(reader, writer)
 
         return writer.getvalue()
-
-    def input_supported(self, input_type: PromptDataType) -> bool:
-        return input_type == "text"
-
-    def output_supported(self, output_type: PromptDataType) -> bool:
-        return output_type == "text"

@@ -12,8 +12,9 @@ import functools
 import inspect
 import logging
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Dict, Type, TypeVar
+from typing import Any, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -57,11 +58,17 @@ class DefaultValueScope:
     be inherited by subclasses.
     """
 
-    class_type: Type
+    class_type: type[object]
     parameter_name: str
     include_subclasses: bool = True
 
     def __hash__(self) -> int:
+        """
+        Return a hash based on class type, parameter name, and subclass inclusion flag.
+
+        Returns:
+            int: Hash value for this scope.
+        """
         return hash((self.class_type, self.parameter_name, self.include_subclasses))
 
 
@@ -74,12 +81,13 @@ class GlobalDefaultValues:
     """
 
     def __init__(self) -> None:
-        self._default_values: Dict[DefaultValueScope, Any] = {}
+        """Initialize the global default values registry."""
+        self._default_values: dict[DefaultValueScope, Any] = {}
 
     def set_default_value(
         self,
         *,
-        class_type: Type,
+        class_type: type[object],
         parameter_name: str,
         value: Any,
         include_subclasses: bool = True,
@@ -104,7 +112,7 @@ class GlobalDefaultValues:
     def get_default_value(
         self,
         *,
-        class_type: Type,
+        class_type: type[object],
         parameter_name: str,
     ) -> tuple[bool, Any]:
         """
@@ -143,7 +151,7 @@ class GlobalDefaultValues:
         logger.debug("Reset all default values")
 
     @property
-    def all_defaults(self) -> Dict[DefaultValueScope, Any]:
+    def all_defaults(self) -> dict[DefaultValueScope, Any]:
         """Get a copy of all current default values."""
         return self._default_values.copy()
 
@@ -153,13 +161,18 @@ _global_default_values = GlobalDefaultValues()
 
 
 def get_global_default_values() -> GlobalDefaultValues:
-    """Get the global default values registry."""
+    """
+    Get the global default values registry.
+
+    Returns:
+        GlobalDefaultValues: The global default values registry instance.
+    """
     return _global_default_values
 
 
 def set_default_value(
     *,
-    class_type: Type,
+    class_type: type[object],
     parameter_name: str,
     value: Any,
     include_subclasses: bool = True,
@@ -215,14 +228,13 @@ def set_global_variable(*, name: str, value: Any) -> None:
         variable accessible to code that imports or executes after the initialization
         script runs.
     """
-
     # Set the variable in the __main__ module's global namespace
     sys.modules["__main__"].__dict__[name] = value
 
 
-def apply_defaults_to_method(method):
+def apply_defaults_to_method(method: Callable[..., T]) -> Callable[..., T]:
     """
-    Decorator that applies default values to a method's parameters.
+    Apply default values to a method's parameters.
 
     This decorator looks up default values for the method's class and applies them
     to parameters that are None or not provided.
@@ -235,7 +247,7 @@ def apply_defaults_to_method(method):
     """
 
     @functools.wraps(method)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self: object, *args: object, **kwargs: object) -> T:
         # Get the class of the instance
         cls = self.__class__
 
@@ -282,9 +294,9 @@ def apply_defaults_to_method(method):
     return wrapper
 
 
-def apply_defaults(method):
+def apply_defaults(method: Callable[..., T]) -> Callable[..., T]:
     """
-    Decorator that applies default values to a class constructor.
+    Apply default values to a class constructor.
 
     This is an alias for apply_defaults_to_method for backward compatibility.
 

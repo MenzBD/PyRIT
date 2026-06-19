@@ -4,19 +4,29 @@
 import asyncio
 import copy
 import logging
+import os
+import tempfile
 import traceback
-from typing import Any, Dict, List, Optional
+import wave
+from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-from pyrit.exceptions import EmptyResponseException
-from pyrit.memory import CentralMemory, MemoryInterface
+from pyrit.common.deprecation import print_deprecation_message
+from pyrit.exceptions import (
+    ComponentRole,
+    EmptyResponseException,
+    execution_context,
+    get_execution_context,
+)
+from pyrit.memory import CentralMemory, MemoryInterface, set_message_piece_sha256_async
 from pyrit.models import (
+    ComponentIdentifier,
+    Conversation,
     Message,
     MessagePiece,
-    SeedGroup,
     construct_response_from_request,
 )
-from pyrit.models.filter_criteria import PromptConverterState, PromptFilterCriteria
 from pyrit.prompt_normalizer import NormalizerRequest, PromptConverterConfiguration
 from pyrit.prompt_target import PromptTarget
 from pyrit.prompt_target.batch_helper import batch_task_async
@@ -25,11 +35,27 @@ logger = logging.getLogger(__name__)
 
 
 class PromptNormalizer:
-    _memory: MemoryInterface = None
+    """
+    Handles normalization and processing of prompts before they are sent to targets.
+    """
+
+    _memory: MemoryInterface | None = None
+
+    @property
+    def memory(self) -> MemoryInterface:
+        """
+        Get the memory instance.
+
+        Raises:
+            RuntimeError: If memory is not initialized.
+        """
+        if self._memory is None:
+            raise RuntimeError("Memory is not initialized")
+        return self._memory
 
     def __init__(self, start_token: str = "⟪", end_token: str = "⟫") -> None:
         """
-        Initializes the PromptNormalizer.
+        Initialize the PromptNormalizer.
 
         start_token and end_token are used to delineate which part of a prompt is converted.
         """
@@ -37,78 +63,98 @@ class PromptNormalizer:
         self._start_token = start_token
         self._end_token = end_token
         self.id = str(uuid4())
-        self._skip_criteria: Optional[PromptFilterCriteria] = None
 
     async def send_prompt_async(
         self,
         *,
-        seed_group: SeedGroup,
+        message: Message,
         target: PromptTarget,
-        conversation_id: Optional[str] = None,
-        request_converter_configurations: list[PromptConverterConfiguration] = [],
-        response_converter_configurations: list[PromptConverterConfiguration] = [],
-        labels: Optional[dict[str, str]] = None,
-        attack_identifier: Optional[dict[str, str]] = None,
+        conversation_id: str | None = None,
+        request_converter_configurations: list[PromptConverterConfiguration] | None = None,
+        response_converter_configurations: list[PromptConverterConfiguration] | None = None,
+        labels: dict[str, str] | None = None,
+        attack_identifier: ComponentIdentifier | None = None,
     ) -> Message:
         """
-        Sends a single request to a target.
+        Send a single request to a target.
 
         Args:
-            seed_group (SeedGroup): The seed group to be sent.
+            message (Message): The message to be sent.
             target (PromptTarget): The target to which the prompt is sent.
             conversation_id (str, optional): The ID of the conversation. Defaults to None.
             request_converter_configurations (list[PromptConverterConfiguration], optional): Configurations for
                 converting the request. Defaults to an empty list.
             response_converter_configurations (list[PromptConverterConfiguration], optional): Configurations for
                 converting the response. Defaults to an empty list.
-            labels (Optional[dict[str, str]], optional): Labels associated with the request. Defaults to None.
-            attack_identifier (Optional[dict[str, str]], optional): Identifier for the attack. Defaults to
-                None.
-
-            Raises:
-            Exception: If an error occurs during the request processing.
-            ValueError: If the prompts in the SeedGroup are not part of the same sequence.
+            labels (dict[str, str] | None, optional): Labels associated with the request. Defaults to None.
+                Deprecated: This parameter will be removed in a release 0.16.0.
+            attack_identifier (ComponentIdentifier | None, optional): Identifier for the attack. Defaults to
+                None. Deprecated: this parameter is ignored and will be removed in release 0.17.0.
 
         Returns:
             Message: The response received from the target.
-        """
-        # Validates that the SeedPrompts in the SeedGroup are part of the same sequence
-        if len(set(prompt.sequence for prompt in seed_group.prompts)) > 1:
-            raise ValueError("All SeedPrompts in the SeedGroup must have the same sequence.")
 
-        request = await self._build_message(
-            seed_group=seed_group,
-            conversation_id=conversation_id,
-            request_converter_configurations=request_converter_configurations,
-            target=target,
-            labels=labels,
-            attack_identifier=attack_identifier,
+        Raises:
+            Exception: If an error occurs during the request processing.
+            ValueError: If the message pieces are not part of the same sequence.
+        """
+        if labels is not None:
+            print_deprecation_message(
+                old_item="send_prompt_async(..., labels=...)",
+                new_item="send_prompt_async(...)",
+                removed_in="0.16.0",
+            )
+        if attack_identifier is not None:
+            print_deprecation_message(
+                old_item="send_prompt_async(..., attack_identifier=...)",
+                new_item="send_prompt_async(...)",
+                removed_in="0.17.0",
+            )
+        # Validates that the MessagePieces in the Message are part of the same sequence
+        request_converter_configurations = request_converter_configurations or []
+        response_converter_configurations = response_converter_configurations or []
+        if len({piece.sequence for piece in message.message_pieces}) > 1:
+            raise ValueError("All MessagePieces in the Message must have the same sequence.")
+
+        # Prepare the request by updating conversation ID, labels, and attack identifier
+        request = copy.deepcopy(message)
+        conversation_id = conversation_id if conversation_id else str(uuid4())
+        target_identifier = target.get_identifier()
+        self.memory.add_conversation_to_memory(
+            conversation=Conversation(conversation_id=conversation_id, target_identifier=target_identifier)
         )
 
-        await self._calc_hash(request=request)
+        for piece in request.message_pieces:
+            piece.conversation_id = conversation_id
+            if labels:
+                piece.labels = labels  # deprecated
 
-        if self._should_skip_based_on_skip_criteria(request):
-            return None
+        # Apply request converters
+        await self.convert_values_async(converter_configurations=request_converter_configurations, message=request)
 
-        response = None
+        await self._calc_hash_async(request=request)
+
+        responses = None
 
         try:
-            response = await target.send_prompt_async(message=request)
-            self._memory.add_message_to_memory(request=request)
+            responses = await target.send_prompt_async(message=request)
+            self.memory.add_message_to_memory(request=request)
         except EmptyResponseException:
             # Empty responses are retried, but we don't want them to stop execution
-            self._memory.add_message_to_memory(request=request)
+            self.memory.add_message_to_memory(request=request)
 
-            response = construct_response_from_request(
-                request=request.message_pieces[0],
-                response_text_pieces=[""],
-                response_type="text",
-                error="empty",
-            )
+            responses = [
+                construct_response_from_request(
+                    request=request.message_pieces[0],
+                    response_text_pieces=[""],
+                    response_type="text",
+                    error="empty",
+                )
+            ]
 
         except Exception as ex:
             # Ensure request to memory before processing exception
-            self._memory.add_message_to_memory(request=request)
+            self.memory.add_message_to_memory(request=request)
 
             error_response = construct_response_from_request(
                 request=request.message_pieces[0],
@@ -117,61 +163,82 @@ class PromptNormalizer:
                 error="processing",
             )
 
-            await self._calc_hash(request=error_response)
-            self._memory.add_message_to_memory(request=error_response)
+            await self._calc_hash_async(request=error_response)
+            self.memory.add_message_to_memory(request=error_response)
             cid = request.message_pieces[0].conversation_id if request and request.message_pieces else None
             raise Exception(f"Error sending prompt with conversation ID: {cid}") from ex
 
-        if response is None:
-            return None
+        # handling empty responses message list and None responses
+        if not responses or not any(responses):
+            # An empty list is valid for write-only targets (e.g., TextTarget)
+            # that don't produce responses. Return the request as-is.
+            if responses is not None and len(responses) == 0:
+                return request
+            empty_response = construct_response_from_request(
+                request=request.message_pieces[0],
+                response_text_pieces=[""],
+                response_type="text",
+                error="empty",
+            )
+            await self._calc_hash_async(request=empty_response)
+            self.memory.add_message_to_memory(request=empty_response)
+            return empty_response
 
-        await self.convert_values(converter_configurations=response_converter_configurations, message=response)
+        # Process all response messages (targets return list[Message])
+        # Only apply response converters to the last message (final response)
+        # Intermediate messages are tool calls/outputs that don't need conversion
+        for i, resp in enumerate(responses):
+            is_last = i == len(responses) - 1
+            if is_last:
+                await self.convert_values_async(
+                    converter_configurations=response_converter_configurations, message=resp
+                )
+            await self._calc_hash_async(request=resp)
+            self.memory.add_message_to_memory(request=resp)
 
-        await self._calc_hash(request=response)
-        self._memory.add_message_to_memory(request=response)
-        return response
+        # Return the last response for backward compatibility
+        return responses[-1]
 
     async def send_prompt_batch_to_target_async(
         self,
         *,
         requests: list[NormalizerRequest],
         target: PromptTarget,
-        labels: Optional[dict[str, str]] = None,
-        attack_identifier: Optional[dict[str, str]] = None,
+        labels: dict[str, str] | None = None,
+        attack_identifier: ComponentIdentifier | None = None,
         batch_size: int = 10,
     ) -> list[Message]:
         """
-        Sends a batch of prompts to the target asynchronously.
+        Send a batch of prompts to the target asynchronously.
 
         Args:
             requests (list[NormalizerRequest]): A list of NormalizerRequest objects to be sent.
             target (PromptTarget): The target to which the prompts are sent.
-            labels (Optional[dict[str, str]], optional): A dictionary of labels to be included with the request.
+            labels (dict[str, str] | None, optional): A dictionary of labels to be included with the request.
                 Defaults to None.
-            attack_identifier (Optional[dict[str, str]], optional): A dictionary identifying the attack.
-                Defaults to None.
+            attack_identifier (ComponentIdentifier | None, optional): The attack identifier.
+                Defaults to None. Deprecated: this parameter is ignored and will be removed in release 0.17.0.
             batch_size (int, optional): The number of prompts to include in each batch. Defaults to 10.
 
         Returns:
             list[Message]: A list of Message objects representing the responses
                 received for each prompt.
         """
-
-        batch_items: List[List[Any]] = [
-            [request.seed_group for request in requests],
+        batch_items: list[list[Any]] = [
+            [request.message for request in requests],
             [request.request_converter_configurations for request in requests],
             [request.response_converter_configurations for request in requests],
             [request.conversation_id for request in requests],
         ]
 
         batch_item_keys = [
-            "seed_group",
+            "message",
             "request_converter_configurations",
             "response_converter_configurations",
             "conversation_id",
         ]
 
-        responses = await batch_task_async(
+        return await batch_task_async(
             prompt_target=target,
             batch_size=batch_size,
             items_to_batch=batch_items,
@@ -182,15 +249,22 @@ class PromptNormalizer:
             attack_identifier=attack_identifier,
         )
 
-        # send_prompt_async can return None if the prompt is skipped
-        return [response for response in responses if response is not None]
-
-    async def convert_values(
+    async def convert_values_async(
         self,
         converter_configurations: list[PromptConverterConfiguration],
         message: Message,
-    ):
+    ) -> None:
+        """
+        Apply converter configurations to message pieces.
 
+        Args:
+            converter_configurations (list[PromptConverterConfiguration]): List of configurations specifying
+                which converters to apply and to which message pieces.
+            message (Message): The message containing pieces to be converted.
+
+        Raises:
+            Exception: Any exception from converters propagates with execution context for error tracing.
+        """
         for converter_configuration in converter_configurations:
             for piece_index, piece in enumerate(message.message_pieces):
                 indexes = converter_configuration.indexes_to_apply
@@ -209,185 +283,249 @@ class PromptNormalizer:
                 converted_text_data_type = piece.converted_value_data_type
 
                 for converter in converter_configuration.converters:
-                    converter_result = await converter.convert_tokens_async(
-                        prompt=converted_text,
-                        input_type=converted_text_data_type,
-                        start_token=self._start_token,
-                        end_token=self._end_token,
-                    )
-                    converted_text = converter_result.output_text
-                    converted_text_data_type = converter_result.output_type
+                    # Inherit attack context from outer execution context (set by attack strategy)
+                    outer_context = get_execution_context()
+
+                    try:
+                        with execution_context(
+                            component_role=ComponentRole.CONVERTER,
+                            attack_strategy_name=outer_context.attack_strategy_name if outer_context else None,
+                            attack_identifier=outer_context.attack_identifier if outer_context else None,
+                            component_identifier=converter.get_identifier(),
+                            objective_target_conversation_id=(
+                                outer_context.objective_target_conversation_id if outer_context else None
+                            ),
+                        ):
+                            converter_result = await converter.convert_tokens_async(
+                                prompt=converted_text,
+                                input_type=converted_text_data_type,
+                                start_token=self._start_token,
+                                end_token=self._end_token,
+                            )
+                        converted_text = converter_result.output_text
+                        converted_text_data_type = converter_result.output_type
+                    except Exception:
+                        # Let the exception propagate - execution context will add converter details
+                        raise
 
                 piece.converted_value = converted_text
                 piece.converted_value_data_type = converted_text_data_type
 
-    def set_skip_criteria(
-        self, skip_criteria: PromptFilterCriteria, skip_value_type: PromptConverterState, ensure_response=True
-    ) -> None:
-        """
-        Sets the skip criteria for the attack.
-
-        If prompts match this in memory and are the same as one being sent, then they won't be sent to a target.
-
-        Prompts are the same if either the original prompt or the converted prompt, determined by skip_value_type flag.
-        """
-        self._skip_criteria = skip_criteria
-
-        skip_args: Dict[str, Any] = {
-            "attack_id": self._skip_criteria.attack_id,
-            "conversation_id": self._skip_criteria.conversation_id,
-            "prompt_ids": self._skip_criteria.prompt_ids,
-            "labels": self._skip_criteria.labels,
-            "sent_after": self._skip_criteria.sent_after,
-            "sent_before": self._skip_criteria.sent_before,
-            "original_values": self._skip_criteria.original_values,
-            "converted_values": self._skip_criteria.converted_values,
-            "data_type": self._skip_criteria.data_type,
-            "not_data_type": self._skip_criteria.not_data_type,
-            "converted_value_sha256": self._skip_criteria.converted_value_sha256,
-        }
-
-        prompts_to_skip = self._memory.get_message_pieces(role="user", **skip_args)
-
-        if ensure_response:
-            # If a request was sent but we don't have a response we need to retry
-            # so remove such requests from the prompts to skip list.
-            responses = self._memory.get_message_pieces(role="assistant", **skip_args)
-            response_conversation_ids = {response.conversation_id for response in responses}
-            prompt_conversation_ids = {prompt.conversation_id for prompt in prompts_to_skip}
-            missing_response_conversation_ids = prompt_conversation_ids - response_conversation_ids
-            prompts_to_skip = [
-                prompt for prompt in prompts_to_skip if prompt.conversation_id not in missing_response_conversation_ids
-            ]
-
-        self._original_sha256_prompts_to_skip = [
-            prompt.original_value_sha256 for prompt in prompts_to_skip if prompt.original_value_sha256
-        ]
-
-        self._converted_sha256_prompts_to_skip = [
-            prompt.converted_value_sha256 for prompt in prompts_to_skip if prompt.converted_value_sha256
-        ]
-
-        self._skip_value_type = skip_value_type
-
-    def _should_skip_based_on_skip_criteria(self, message: Message) -> bool:
-        """
-        Filters out prompts from message_list that match the skip criteria.
-
-        Every message_piece of the message needs to have matching sha256 to skip.
-        """
-        if not self._skip_criteria:
-            return False
-
-        for user_prompt in message.message_pieces:
-            if self._skip_value_type == "converted":
-                if user_prompt.converted_value_sha256 not in self._converted_sha256_prompts_to_skip:
-                    return False
-            else:
-                if user_prompt.original_value_sha256 not in self._original_sha256_prompts_to_skip:
-                    return False
-        return True
-
-    async def _calc_hash(self, request: Message) -> None:
-        """
-        Adds a request to the memory.
-        """
-        tasks = [asyncio.create_task(piece.set_sha256_values_async()) for piece in request.message_pieces]
-        await asyncio.gather(*tasks)
-
-    async def _build_message(
+    async def convert_audio_async(
         self,
         *,
-        seed_group: SeedGroup,
-        conversation_id: str,
-        request_converter_configurations: list[PromptConverterConfiguration],
-        target: PromptTarget,
-        labels: dict[str, str],
-        attack_identifier: Optional[dict[str, str]] = None,
-    ) -> Message:
+        raw_pcm: bytes,
+        converter_configurations: list[PromptConverterConfiguration],
+        sample_rate_hz: int,
+        num_channels: int,
+        sample_width_bytes: int,
+    ) -> bytes:
         """
-        Builds a message based on the given parameters.
+        Apply converters to raw PCM audio and return the converted PCM.
 
-        Applies parameters and converters to the prompt text and puts all the pieces together.
+        Wraps the input PCM in a temporary WAV file, builds a single-piece
+        ``audio_path`` ``Message``, runs ``convert_values``, then reads the
+        converted file back as raw PCM. The caller's PCM format is preserved
+        end-to-end; converters that change the format trigger a ``ValueError``
+        on read-back.
 
         Args:
-            seed_group (SeedGroup): The group of seed prompts to be used.
-            conversation_id (str): The ID of the conversation.
-            request_converter_configurations (list[PromptConverterConfiguration]): List of configurations for
-                request converters.
-            target (PromptTarget): The target for the prompt.
-            labels (dict[str, str]): A dictionary of labels associated with the prompt.
-            attack_identifier (Optional[dict[str, str]]): An optional dictionary for attack identifiers.
+            raw_pcm (bytes): Raw PCM audio samples (no WAV header).
+            converter_configurations (list[PromptConverterConfiguration]):
+                Converters to apply. If empty, ``raw_pcm`` is returned unchanged
+                and no temp file is written.
+            sample_rate_hz (int): Sample rate of the PCM in Hz.
+            num_channels (int): Channel count (1 for mono, 2 for stereo).
+            sample_width_bytes (int): Bytes per sample (2 for PCM16).
 
         Returns:
-            Message: The message object.
+            bytes: The converted raw PCM, matching the input format.
+
+        Raises:
+            ValueError: If the converted audio has a different sample rate,
+                channel count, or sample width than the input.
         """
+        if not converter_configurations:
+            return raw_pcm
 
-        entries = []
-
-        # All message pieces within Message needs to have same conversation ID.
-        conversation_id = conversation_id if conversation_id else str(uuid4())
-        for seed_prompt in seed_group.prompts:
-            message_piece = MessagePiece(
-                role=seed_prompt.role,
-                original_value=seed_prompt.value,
-                conversation_id=conversation_id,
-                sequence=seed_prompt.sequence,
-                labels=labels,
-                prompt_metadata=seed_prompt.metadata,
-                prompt_target_identifier=target.get_identifier(),
-                attack_identifier=attack_identifier,
-                original_value_data_type=seed_prompt.data_type,
-                targeted_harm_categories=list(seed_prompt.harm_categories) if seed_prompt.harm_categories else None,
+        input_path = _write_pcm_to_temp_wav(
+            raw_pcm=raw_pcm,
+            sample_rate_hz=sample_rate_hz,
+            num_channels=num_channels,
+            sample_width_bytes=sample_width_bytes,
+        )
+        try:
+            piece = MessagePiece(
+                role="user",
+                original_value=input_path,
+                original_value_data_type="audio_path",
+                converted_value=input_path,
+                converted_value_data_type="audio_path",
             )
+            message = Message(message_pieces=[piece])
+            await self.convert_values(
+                converter_configurations=converter_configurations,
+                message=message,
+            )
+            actual_rate, actual_channels, actual_width, converted_pcm = _read_pcm_from_wav(piece.converted_value)
+            if (actual_rate, actual_channels, actual_width) != (
+                sample_rate_hz,
+                num_channels,
+                sample_width_bytes,
+            ):
+                raise ValueError(
+                    "Converted audio format mismatch: expected "
+                    f"channels={num_channels} sampwidth={sample_width_bytes} "
+                    f"rate={sample_rate_hz}, got channels={actual_channels} "
+                    f"sampwidth={actual_width} rate={actual_rate}."
+                )
+            return converted_pcm
+        finally:
+            Path(input_path).unlink(missing_ok=True)
 
-            entries.append(message_piece)
+    async def _calc_hash_async(self, request: Message) -> None:
+        """Add a request to the memory."""
+        tasks = [asyncio.create_task(set_message_piece_sha256_async(piece)) for piece in request.message_pieces]
+        await asyncio.gather(*tasks)
 
-        response = Message(message_pieces=entries)
+    async def hash_and_persist_message_async(self, *, message: Message) -> None:
+        """
+        Hash and persist a Message to memory.
 
-        await self.convert_values(converter_configurations=request_converter_configurations, message=response)
-        return response
+        Use when a target assembles a Message outside the ``send_prompt_async`` flow
+        (e.g. streaming sessions that yield per-turn Messages directly). Register the
+        conversation once via ``MemoryInterface.add_conversation_to_memory`` before
+        persisting its messages.
 
-    async def add_prepended_conversation_to_memory(
+        Args:
+            message (Message): The message to hash and persist.
+        """
+        await self._calc_hash_async(request=message)
+        self.memory.add_message_to_memory(request=message)
+
+    async def add_prepended_conversation_to_memory_async(
         self,
         conversation_id: str,
         should_convert: bool = True,
-        converter_configurations: Optional[list[PromptConverterConfiguration]] = None,
-        attack_identifier: Optional[dict[str, str]] = None,
-        prepended_conversation: Optional[list[Message]] = None,
-    ) -> Optional[list[Message]]:
+        converter_configurations: list[PromptConverterConfiguration] | None = None,
+        attack_identifier: ComponentIdentifier | None = None,
+        prepended_conversation: list[Message] | None = None,
+        target_identifier: ComponentIdentifier | None = None,
+    ) -> list[Message] | None:
         """
-        Processes the prepended conversation by converting it if needed and adding it to memory.
+        Process the prepended conversation by converting it if needed and adding it to memory.
 
         Args:
             conversation_id (str): The conversation ID to use for the message pieces
             should_convert (bool): Whether to convert the prepended conversation
-            converter_configurations (Optional[list[PromptConverterConfiguration]]): Configurations for converting the
+            converter_configurations (list[PromptConverterConfiguration] | None): Configurations for converting the
                 request
-            attack_identifier (Optional[dict[str, str]]): Identifier for the attack
-            prepended_conversation (Optional[list[Message]]): The conversation to prepend
+            attack_identifier (ComponentIdentifier | None): Identifier for the attack.
+                Deprecated: this parameter is ignored and will be removed in release 0.17.0.
+            prepended_conversation (list[Message] | None): The conversation to prepend
+            target_identifier (ComponentIdentifier | None): The target the conversation is held
+                with, if known. Recorded once per conversation.
 
         Returns:
-            Optional[list[Message]]: The processed prepended conversation
+            list[Message] | None: The processed prepended conversation
         """
         if not prepended_conversation:
             return None
 
+        if attack_identifier is not None:
+            print_deprecation_message(
+                old_item="add_prepended_conversation_to_memory_async(..., attack_identifier=...)",
+                new_item="add_prepended_conversation_to_memory_async(...)",
+                removed_in="0.17.0",
+            )
+
         # Create a deep copy of the prepended conversation to avoid modifying the original
         prepended_conversation = copy.deepcopy(prepended_conversation)
+        self.memory.add_conversation_to_memory(
+            conversation=Conversation(conversation_id=conversation_id, target_identifier=target_identifier)
+        )
 
         for request in prepended_conversation:
             if should_convert and converter_configurations:
-                await self.convert_values(message=request, converter_configurations=converter_configurations)
+                await self.convert_values_async(message=request, converter_configurations=converter_configurations)
             for piece in request.message_pieces:
                 piece.conversation_id = conversation_id
-                if attack_identifier:
-                    piece.attack_identifier = attack_identifier
 
                 # if the piece is retrieved from somewhere else, it needs to be unique
                 # and if not, this won't hurt anything
                 piece.id = uuid4()
 
-            self._memory.add_message_to_memory(request=request)
+            self.memory.add_message_to_memory(request=request)
 
         return prepended_conversation
+
+    async def convert_values(  # pyrit-async-suffix-exempt
+        self,
+        converter_configurations: list[PromptConverterConfiguration],
+        message: Message,
+    ) -> None:
+        """Use ``convert_values_async`` instead; this is a deprecated alias."""
+        print_deprecation_message(
+            old_item="pyrit.prompt_normalizer.PromptNormalizer.convert_values",
+            new_item="pyrit.prompt_normalizer.PromptNormalizer.convert_values_async",
+            removed_in="0.16.0",
+        )
+        await self.convert_values_async(converter_configurations=converter_configurations, message=message)
+
+    async def add_prepended_conversation_to_memory(  # pyrit-async-suffix-exempt
+        self,
+        conversation_id: str,
+        should_convert: bool = True,
+        converter_configurations: list[PromptConverterConfiguration] | None = None,
+        attack_identifier: ComponentIdentifier | None = None,
+        prepended_conversation: list[Message] | None = None,
+        target_identifier: ComponentIdentifier | None = None,
+    ) -> list[Message] | None:
+        """
+        Use ``add_prepended_conversation_to_memory_async`` instead; this is a deprecated alias.
+
+        Returns:
+            list[Message] | None: Same as ``add_prepended_conversation_to_memory_async``.
+        """
+        print_deprecation_message(
+            old_item="pyrit.prompt_normalizer.PromptNormalizer.add_prepended_conversation_to_memory",
+            new_item="pyrit.prompt_normalizer.PromptNormalizer.add_prepended_conversation_to_memory_async",
+            removed_in="0.16.0",
+        )
+        return await self.add_prepended_conversation_to_memory_async(
+            conversation_id=conversation_id,
+            should_convert=should_convert,
+            converter_configurations=converter_configurations,
+            attack_identifier=attack_identifier,
+            prepended_conversation=prepended_conversation,
+            target_identifier=target_identifier,
+        )
+
+
+def _write_pcm_to_temp_wav(
+    *,
+    raw_pcm: bytes,
+    sample_rate_hz: int,
+    num_channels: int,
+    sample_width_bytes: int,
+) -> str:
+    """Return the path of a new temp WAV file containing the given PCM."""
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with wave.open(path, "wb") as wav_out:
+        wav_out.setnchannels(num_channels)
+        wav_out.setsampwidth(sample_width_bytes)
+        wav_out.setframerate(sample_rate_hz)
+        wav_out.writeframes(raw_pcm)
+    return path
+
+
+def _read_pcm_from_wav(wav_path: str) -> tuple[int, int, int, bytes]:
+    """Return (sample_rate_hz, num_channels, sample_width_bytes, pcm_bytes) from a WAV file."""
+    with wave.open(wav_path, "rb") as wav_in:
+        return (
+            wav_in.getframerate(),
+            wav_in.getnchannels(),
+            wav_in.getsampwidth(),
+            wav_in.readframes(wav_in.getnframes()),
+        )

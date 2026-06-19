@@ -3,16 +3,18 @@
 
 import json
 import logging
-from typing import Any, Literal, Optional, Sequence
+from collections.abc import Callable
+from typing import Any, Literal
 
-from pyrit.auth.azure_auth import AzureAuth, get_default_scope
 from pyrit.common import default_values, net_utility
 from pyrit.models import (
+    ComponentIdentifier,
     Message,
-    MessagePiece,
     construct_response_from_request,
 )
-from pyrit.prompt_target import PromptTarget, limit_requests_per_minute
+from pyrit.prompt_target.common.prompt_target import PromptTarget
+from pyrit.prompt_target.common.target_configuration import TargetConfiguration
+from pyrit.prompt_target.common.utils import limit_requests_per_minute
 
 logger = logging.getLogger(__name__)
 
@@ -46,19 +48,26 @@ class PromptShieldTarget(PromptTarget):
 
     ENDPOINT_URI_ENVIRONMENT_VARIABLE: str = "AZURE_CONTENT_SAFETY_API_ENDPOINT"
     API_KEY_ENVIRONMENT_VARIABLE: str = "AZURE_CONTENT_SAFETY_API_KEY"
+
     _endpoint: str
-    _api_key: str | None
+    _api_key: str | Callable[[], str] | None
     _api_version: str
     _force_entry_field: PromptShieldEntryField
 
+    # Grandfathered: ``endpoint`` and ``api_key`` are part of the public
+    # positional API.
+    # TODO: remove this opt-out and insert ``*,`` after ``self`` in 0.16.0
+    # (this will be a BREAKING CHANGE for callers passing arguments positionally).
+    _brick_legacy_init = True
+
     def __init__(
         self,
-        endpoint: Optional[str] = None,
-        api_key: Optional[str] = None,
-        api_version: Optional[str] = "2024-09-01",
-        use_entra_auth: bool = False,
-        field: Optional[PromptShieldEntryField] = None,
-        max_requests_per_minute: Optional[int] = None,
+        endpoint: str | None = None,
+        api_key: str | Callable[[], str] | None = None,
+        api_version: str | None = "2024-09-01",
+        field: PromptShieldEntryField | None = None,
+        max_requests_per_minute: int | None = None,
+        custom_configuration: TargetConfiguration | None = None,
     ) -> None:
         """
         Class that initializes an Azure Content Safety Prompt Shield Target.
@@ -66,49 +75,73 @@ class PromptShieldTarget(PromptTarget):
         Args:
             endpoint (str, Optional): The endpoint URL for the Azure Content Safety service.
                 Defaults to the `ENDPOINT_URI_ENVIRONMENT_VARIABLE` environment variable.
-            api_key (str, Optional): The API key for accessing the Azure Content Safety service
-                (only if you're not using Entra auth). Defaults to the `API_KEY_ENVIRONMENT_VARIABLE`
-                environment variable.
+            api_key (str | Callable[[], str | Awaitable[str]], Optional):
+                The API key for accessing the Azure Content Safety service,
+                or a callable that returns an access token. For Azure endpoints with Entra authentication,
+                pass a token provider from pyrit.auth
+                (e.g., get_azure_token_provider('https://cognitiveservices.azure.com/.default')).
+                Defaults to the `API_KEY_ENVIRONMENT_VARIABLE` environment variable.
             api_version (str, Optional): The version of the Azure Content Safety API. Defaults to "2024-09-01".
-            use_entra_auth (bool, Optional): Whether to use Entra ID authentication. Defaults to False.
             field (PromptShieldEntryField, Optional): If "userPrompt", all input is sent to the userPrompt field.
                 If "documents", all input is sent to the documents field. If None, the input is parsed to separate
                 userPrompt and documents. Defaults to None.
             max_requests_per_minute (int, Optional): Number of requests the target can handle per
                 minute before hitting a rate limit. The number of requests sent to the target
                 will be capped at the value provided.
-        """
+            custom_configuration (TargetConfiguration, Optional): Override the default configuration for
+                this target instance. Defaults to None.
 
+        Raises:
+            ValueError: If the endpoint value is not provided.
+        """
         endpoint_value = default_values.get_required_value(
             env_var_name=self.ENDPOINT_URI_ENVIRONMENT_VARIABLE, passed_value=endpoint
         )
-        super().__init__(max_requests_per_minute=max_requests_per_minute, endpoint=endpoint_value)
+        if endpoint_value is None:
+            raise ValueError("Endpoint value is required")
+        super().__init__(
+            max_requests_per_minute=max_requests_per_minute,
+            endpoint=endpoint_value,
+            custom_configuration=custom_configuration,
+        )
 
-        self._api_version = api_version
-        if use_entra_auth:
-            if api_key:
-                raise ValueError("If using Entra ID auth, please do not specify api_key.")
-            scope = get_default_scope(self._endpoint)
-            self._azure_auth = AzureAuth(token_scope=scope)
-            self._api_key = None
-        else:
-            self._api_key = default_values.get_required_value(
-                env_var_name=self.API_KEY_ENVIRONMENT_VARIABLE, passed_value=api_key
-            )
-            self._azure_auth = None
+        self._api_version = api_version or "2024-09-01"
+
+        # API key is required - either from parameter or environment variable
+        _api_key_value = default_values.get_required_value(
+            env_var_name=self.API_KEY_ENVIRONMENT_VARIABLE, passed_value=api_key
+        )
+        if _api_key_value is None:
+            raise ValueError("API key is required")
+        self._api_key = _api_key_value
 
         self._force_entry_field: PromptShieldEntryField = field
 
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier with Prompt Shield-specific parameters.
+
+        Returns:
+            ComponentIdentifier: The identifier for this target instance.
+        """
+        return self._create_identifier(
+            params={
+                "api_version": self._api_version,
+                "force_entry_field": self._force_entry_field if self._force_entry_field else None,
+            },
+        )
+
     @limit_requests_per_minute
-    async def send_prompt_async(self, *, message: Message) -> Message:
+    async def _send_prompt_to_target_async(self, *, normalized_conversation: list[Message]) -> list[Message]:
         """
-        Parses the text in message to separate the userPrompt and documents contents,
-        then sends an HTTP request to the endpoint and obtains a response in JSON. For more info, visit
-        https://learn.microsoft.com/en-us/azure/ai-services/content-safety/quickstart-jailbreak
+        Parse the text in message to separate the userPrompt and documents contents,
+        then send an HTTP request to the endpoint and obtain a response in JSON. For more info, visit
+        https://learn.microsoft.com/en-us/azure/ai-services/content-safety/quickstart-jailbreak.
+
+        Returns:
+            list[Message]: A list containing the response object with generated text pieces.
         """
-
-        self._validate_request(message=message)
-
+        message = normalized_conversation[-1]
         request = message.message_pieces[0]
 
         logger.info(f"Sending the following prompt to the prompt target: {request}")
@@ -123,7 +156,7 @@ class PromptShieldTarget(PromptTarget):
             "api-version": self._api_version,
         }
 
-        parsed_prompt: dict = self._input_parser(request.original_value)
+        parsed_prompt: dict[str, Any] = self._input_parser(request.original_value)
 
         body = {"userPrompt": parsed_prompt["userPrompt"], "documents": parsed_prompt["documents"]}
 
@@ -148,24 +181,19 @@ class PromptShieldTarget(PromptTarget):
             prompt_metadata=request.prompt_metadata,
         )
 
-        return response_entry
+        return [response_entry]
 
-    def _validate_request(self, *, message: Message) -> None:
-        message_pieces: Sequence[MessagePiece] = message.message_pieces
-
-        n_pieces = len(message_pieces)
-        if n_pieces != 1:
-            raise ValueError(f"This target only supports a single message piece. Received: {n_pieces} pieces.")
-
-        piece_type = message_pieces[0].converted_value_data_type
-        if piece_type != "text":
-            raise ValueError(f"This target only supports text prompt input. Received: {piece_type}.")
-
-    def _validate_response(self, request_body: dict, response_body: dict) -> None:
+    def _validate_response(self, request_body: dict[str, Any], response_body: dict[str, Any]) -> None:
         """
-        Ensures that every field sent to the Prompt Shield was analyzed.
-        """
+        Ensure that every field sent to the Prompt Shield was analyzed.
 
+        Args:
+            request_body: The request body sent to Prompt Shield.
+            response_body: The response body received from Prompt Shield.
+
+        Raises:
+            ValueError: If any field sent was not analyzed.
+        """
         user_prompt_sent: str | None = request_body.get("userPrompt")
         documents_sent: list[str] | None = request_body.get("documents")
 
@@ -180,10 +208,15 @@ class PromptShieldTarget(PromptTarget):
 
     def _input_parser(self, input_str: str) -> dict[str, Any]:
         """
-        Parses the input given to the target to extract the two fields sent to
-        Prompt Shield: userPrompt: str, and documents: list[str]
-        """
+        Parse the input given to the target to extract the two fields sent to
+        Prompt Shield: userPrompt: str, and documents: list[str].
 
+        Args:
+            input_str: The input string to parse.
+
+        Returns:
+            dict[str, Any]: A dictionary with 'userPrompt' and 'documents' keys.
+        """
         match self._force_entry_field:
             case "userPrompt":
                 return {"userPrompt": input_str, "documents": []}
@@ -205,12 +238,18 @@ class PromptShieldTarget(PromptTarget):
 
                 return {"userPrompt": user_prompt, "documents": documents if documents else []}
 
-    def _add_auth_param_to_headers(self, headers: dict) -> None:
+    def _add_auth_param_to_headers(self, headers: dict[str, str]) -> None:
         """
-        Adds the API key or Entra authentication parameters to the headers.
+        Add the API key or token to the headers.
+
+        Args:
+            headers: The headers dictionary to add authentication to.
         """
         if self._api_key:
-            headers["Ocp-Apim-Subscription-Key"] = self._api_key
-        if self._azure_auth:
-            token = self._azure_auth.refresh_token()
-            headers["Authorization"] = f"Bearer {token}"
+            # If callable, call it to get the token
+            if callable(self._api_key):
+                token = self._api_key()  # type: ignore[ty:call-top-callable]
+                headers["Authorization"] = f"Bearer {token}"
+            else:
+                # String API key
+                headers["Ocp-Apim-Subscription-Key"] = self._api_key

@@ -1,9 +1,12 @@
 # PyRIT-specific configs
 submodules/
-results/
+/results/
 dbdata/
 eval/
 default_memory.json.memory
+
+# Frontend build artifacts copied to backend for packaging
+pyrit/backend/frontend/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -56,6 +59,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.mypy_cache/
 cover/
 
 # Translations
@@ -146,11 +150,6 @@ env-test
 # mkdocs documentation
 /site
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
 # Pyre type checker
 .pyre/
 
@@ -169,10 +168,14 @@ cython_debug/
 
 # PyRIT secrets file
 .env
+.pyrit_cache/
 
 # Cache for generating docs
 doc/generate_docs/cache/*
 !doc/generate_docs/cache/.gitkeep
+
+# nbstrip output
+*_nbqa_ipynb.py
 
 # Jupyterbook build files
 doc/_build/

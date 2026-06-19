@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
+import io
 import logging
 import pathlib
-
-# Import PyRITInitializer for type checking (with TYPE_CHECKING to avoid circular imports)
-from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, Union, get_args
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import dotenv
 
@@ -28,32 +28,75 @@ AZURE_SQL = "AzureSQL"
 MemoryDatabaseType = Literal["InMemory", "SQLite", "AzureSQL"]
 
 
-def _load_environment_files() -> None:
+def _load_environment_files(env_files: Sequence[pathlib.Path] | None, *, silent: bool = False) -> None:
     """
-    Loads the base environment file from .env if it exists,
-    and then loads a single .env.local file if it exists, overriding previous values.
+    Load environment files in the order they are provided.
+    Later files override values from earlier files.
+
+    Args:
+        env_files: Optional sequence of environment file paths. If None, loads default
+            .env and .env.local from PyRIT home directory (only if they exist).
+        silent: If True, suppresses print statements about environment file loading.
+            Defaults to False.
+
+    Raises:
+        ValueError: If any provided env_files do not exist.
     """
-    base_file_path = path.HOME_PATH / ".env"
-    local_file_path = path.HOME_PATH / ".env.local"
+    # Validate env_files exist if they were provided
+    if env_files is not None:
+        if not silent:
+            _print_msg(f"Loading custom environment files: {[str(f) for f in env_files]}", quiet=silent, log=True)
+        for env_file in env_files:
+            if not env_file.exists():
+                raise ValueError(f"Environment file not found: {env_file}")
 
-    # Load the base .env file if it exists
-    if base_file_path.exists():
-        dotenv.load_dotenv(base_file_path, override=True, interpolate=True)
-        logger.info(f"Loaded {base_file_path}")
+    # By default load .env and .env.local from home directory of the package
     else:
-        dotenv.load_dotenv(verbose=True)
+        default_files = []
+        base_file = path.CONFIGURATION_DIRECTORY_PATH / ".env"
+        local_file = path.CONFIGURATION_DIRECTORY_PATH / ".env.local"
 
-    # Load the .env.local file if it exists, to override base .env values
-    if local_file_path.exists():
-        dotenv.load_dotenv(local_file_path, override=True, interpolate=True)
-        logger.info(f"Loaded {local_file_path}")
-    else:
-        dotenv.load_dotenv(dotenv_path=dotenv.find_dotenv(".env.local"), override=True, verbose=True)
+        if base_file.exists():
+            default_files.append(base_file)
+        if local_file.exists():
+            default_files.append(local_file)
+
+        if not silent:
+            if default_files:
+                _print_msg(
+                    f"Found default environment files: {[str(f) for f in default_files]}", quiet=silent, log=True
+                )
+            else:
+                _print_msg(
+                    "No default environment files found. Using system environment variables only.",
+                    quiet=silent,
+                    log=True,
+                )
+
+        env_files = default_files
+
+    for env_file in env_files:
+        dotenv.load_dotenv(env_file, override=True, interpolate=True)
+        if not silent:
+            _print_msg(f"Loaded environment file: {env_file}", quiet=silent, log=True)
 
 
-def _load_initializers_from_scripts(
-    *, script_paths: Sequence[Union[str, pathlib.Path]]
-) -> Sequence["PyRITInitializer"]:
+def _print_msg(message: str, quiet: bool, log: bool) -> None:
+    """
+    Print a standard initialization message unless quiet is True.
+
+    Args:
+        message (str): The message to print and/or log.
+        quiet (bool): If True, suppresses the initialization message.
+        log (bool): If True, logs the message using the logger.
+    """
+    if not quiet:
+        print(message)
+    if log:
+        logger.info(message)
+
+
+def _load_initializers_from_scripts(*, script_paths: Sequence[str | pathlib.Path]) -> Sequence["PyRITInitializer"]:
     """
     Load PyRITInitializer instances from external Python files.
 
@@ -61,7 +104,7 @@ def _load_initializers_from_scripts(
     that inherit from PyRITInitializer will be automatically discovered and instantiated.
 
     Args:
-        script_paths (Sequence[Union[str, pathlib.Path]]): Sequence of file paths to Python scripts to load.
+        script_paths (Sequence[str | pathlib.Path]): Sequence of file paths to Python scripts to load.
 
     Returns:
         Sequence[PyRITInitializer]: List of PyRITInitializer instances loaded from the scripts.
@@ -111,7 +154,12 @@ def _load_initializers_from_scripts(
                 obj = getattr(module, name)
                 # Check if it's a class, is a subclass of PyRITInitializer,
                 # and is not the base class itself
-                if isinstance(obj, type) and issubclass(obj, PyRITInitializer) and obj is not PyRITInitializer:
+                if (
+                    isinstance(obj, type)
+                    and issubclass(obj, PyRITInitializer)
+                    and obj is not PyRITInitializer
+                    and obj.__module__ == module.__name__
+                ):
                     try:
                         # Instantiate the initializer class
                         initializer = obj()
@@ -137,12 +185,74 @@ def _load_initializers_from_scripts(
     return loaded_initializers
 
 
-def _execute_initializers(*, initializers: Sequence["PyRITInitializer"]) -> None:
+def _parse_akv_secret_url(secret_url: str) -> tuple[str, str, str | None]:
     """
-    Execute PyRITInitializer instances in execution order.
+    Parse an AKV secret URL into vault URL, secret name, and optional version.
 
-    Initializers are sorted by their execution_order property before execution.
-    Lower execution_order values run first.
+    Args:
+        secret_url (str): Full AKV secret URL in the format
+            ``https://{vault}.vault.azure.net/secrets/{name}[/{version}]``.
+
+    Returns:
+        tuple[str, str, str | None]: (vault_url, secret_name, secret_version)
+
+    Raises:
+        ValueError: If the URL does not match the expected format.
+    """
+    parts = secret_url.split("/secrets/")
+    if len(parts) != 2:
+        raise ValueError(
+            f"Invalid AKV secret URL: '{secret_url}'. "
+            "Expected format: https://{{vault}}.vault.azure.net/secrets/{{name}}[/{{version}}]"
+        )
+    vault_url = parts[0]
+    name_parts = parts[1].rstrip("/").split("/")
+    secret_name = name_parts[0]
+    secret_version = name_parts[1] if len(name_parts) > 1 else None
+    return vault_url, secret_name, secret_version
+
+
+async def _load_env_from_akv_async(*, secret_urls: Sequence[str], silent: bool = False) -> None:
+    """
+    Load environment variables from Azure Key Vault secrets.
+
+    Each secret's value is treated as the full contents of a ``.env`` file and
+    parsed accordingly. Later secrets override values from earlier ones.
+
+    Authentication uses ``DefaultAzureCredential``, which silently tries managed
+    identity, Azure CLI, VS Code credentials, etc., and falls back to interactive
+    browser authentication when running locally.
+
+    Args:
+        secret_urls (Sequence[str]): Sequence of AKV secret URLs to load, each in
+            the format ``https://{vault}.vault.azure.net/secrets/{name}[/{version}]``.
+        silent (bool): If True, suppresses print statements. Defaults to False.
+
+    Raises:
+        ImportError: If ``azure-keyvault-secrets`` is not installed.
+        ValueError: If a secret URL is malformed.
+    """
+    if not secret_urls:
+        return
+    from azure.identity.aio import DefaultAzureCredential
+    from azure.keyvault.secrets.aio import SecretClient
+
+    credential = DefaultAzureCredential()
+    for secret_url in secret_urls:
+        _print_msg(f"Loading environment from AKV secret: {secret_url}", quiet=silent, log=True)
+        vault_url, secret_name, secret_version = _parse_akv_secret_url(secret_url)
+        client = SecretClient(vault_url=vault_url, credential=credential)
+        secret = await client.get_secret(secret_name, version=secret_version)
+        if secret.value:
+            dotenv.load_dotenv(stream=io.StringIO(secret.value), override=True)
+            _print_msg(f"Loaded environment from AKV secret: {secret_url}", quiet=silent, log=True)
+
+
+async def _execute_initializers_async(*, initializers: Sequence["PyRITInitializer"]) -> None:
+    """
+    Execute PyRITInitializer instances in the order provided.
+
+    Initializers are executed in the order they appear in the sequence.
 
     Args:
         initializers: Sequence of PyRITInitializer instances to execute.
@@ -154,20 +264,15 @@ def _execute_initializers(*, initializers: Sequence["PyRITInitializer"]) -> None
     # Import here to avoid circular imports
     from pyrit.setup.initializers.pyrit_initializer import PyRITInitializer
 
-    # Validate all initializers first before sorting
+    # Validate all initializers first
     for initializer in initializers:
         if not isinstance(initializer, PyRITInitializer):
             raise ValueError(
-                f"All initializers must be PyRITInitializer instances. "
-                f"Got {type(initializer).__name__}: {initializer}"
+                f"All initializers must be PyRITInitializer instances. Got {type(initializer).__name__}: {initializer}"
             )
 
-    # Sort initializers by execution_order (lower numbers first)
-    sorted_initializers = sorted(initializers, key=lambda x: x.execution_order)
-
-    for initializer in sorted_initializers:
-
-        logger.info(f"Executing initializer: {initializer.name}")
+    for initializer in initializers:
+        logger.info(f"Executing initializer: {type(initializer).__name__}")
         logger.debug(f"Description: {initializer.description}")
 
         try:
@@ -175,48 +280,53 @@ def _execute_initializers(*, initializers: Sequence["PyRITInitializer"]) -> None
             initializer.validate()
 
             # Then initialize with tracking to capture what was configured
-            initializer.initialize_with_tracking()
+            await initializer.initialize_with_tracking_async()
 
-            logger.debug(f"Successfully executed initializer: {initializer.name}")
+            logger.debug(f"Successfully executed initializer: {type(initializer).__name__}")
 
         except Exception as e:
-            logger.error(f"Error executing initializer {initializer.name}: {e}")
+            logger.error(f"Error executing initializer {type(initializer).__name__}: {e}")
             raise
 
 
-def initialize_pyrit(
-    memory_db_type: Union[MemoryDatabaseType, str],
+async def initialize_pyrit_async(
+    memory_db_type: MemoryDatabaseType | str,
     *,
-    initialization_scripts: Optional[Sequence[Union[str, pathlib.Path]]] = None,
-    initializers: Optional[Sequence["PyRITInitializer"]] = None,
+    initialization_scripts: Sequence[str | pathlib.Path] | None = None,
+    initializers: Sequence["PyRITInitializer"] | None = None,
+    env_files: Sequence[pathlib.Path] | None = None,
+    env_akv_ref: Sequence[str] | None = None,
+    silent: bool = False,
     **memory_instance_kwargs: Any,
 ) -> None:
     """
-    Initializes PyRIT with the provided memory instance and loads environment files.
+    Initialize PyRIT with the provided memory instance and loads environment files.
 
     Args:
         memory_db_type (MemoryDatabaseType): The MemoryDatabaseType string literal which indicates the memory
             instance to use for central memory. Options include "InMemory", "SQLite", and "AzureSQL".
-        initialization_scripts (Optional[Sequence[Union[str, pathlib.Path]]]): Optional sequence of Python script paths
+        initialization_scripts (Sequence[str | pathlib.Path] | None): Optional sequence of Python script paths
             that contain PyRITInitializer classes. Each script must define either a get_initializers() function
             or an 'initializers' variable that returns/contains a list of PyRITInitializer instances.
-        initializers (Optional[Sequence[PyRITInitializer]]): Optional sequence of PyRITInitializer instances
+        initializers (Sequence[PyRITInitializer] | None): Optional sequence of PyRITInitializer instances
             to execute directly. These provide type-safe, validated configuration with clear documentation.
-        **memory_instance_kwargs (Optional[Any]): Additional keyword arguments to pass to the memory instance.
+        env_files (Sequence[pathlib.Path] | None): Optional sequence of environment file paths to load
+            in order. If not provided, will load default .env and .env.local files from PyRIT home if they exist.
+            All paths must be valid pathlib.Path objects.
+        env_akv_ref (Sequence[str] | None): Optional sequence of Azure Key Vault secret URLs to load.
+            Each secret's value must be the full contents of a .env file. Loaded before ``env_files``
+            so local files take precedence over AKV. Requires ``azure-keyvault-secrets``.
+        silent (bool): If True, suppresses print statements about environment file loading and
+            schema migration. Defaults to False.
+        **memory_instance_kwargs (Any | None): Additional keyword arguments to pass to the memory instance.
+
+    Raises:
+        ValueError: If an unsupported memory_db_type is provided or if env_files contains non-existent files.
     """
+    if env_akv_ref:
+        await _load_env_from_akv_async(secret_urls=env_akv_ref, silent=silent)
 
-    # Handle DuckDB deprecation before validation
-    if memory_db_type == "DuckDB":
-        logger.warning(
-            "DuckDB is no longer supported and has been replaced by SQLite for better compatibility and performance. "
-            "Please update your code to use SQLite instead. "
-            "For migration guidance, see the SQLite Memory documentation at: "
-            "doc/code/memory/1_sqlite_memory.ipynb. "
-            "Using in-memory SQLite instead."
-        )
-        memory_db_type = IN_MEMORY
-
-    _load_environment_files()
+    _load_environment_files(env_files=env_files, silent=silent)
 
     # Reset all default values before executing initialization scripts
     # This ensures a clean state for each initialization
@@ -229,17 +339,18 @@ def initialize_pyrit(
 
     if memory_db_type == IN_MEMORY:
         logger.info("Using in-memory SQLite database.")
-        memory = SQLiteMemory(db_path=":memory:", **memory_instance_kwargs)
+        memory = SQLiteMemory(db_path=":memory:", silent=silent, **memory_instance_kwargs)  # type: ignore[ty:invalid-assignment]
     elif memory_db_type == SQLITE:
         logger.info("Using persistent SQLite database.")
-        memory = SQLiteMemory(**memory_instance_kwargs)
+        memory = SQLiteMemory(silent=silent, **memory_instance_kwargs)  # type: ignore[ty:invalid-assignment]
     elif memory_db_type == AZURE_SQL:
         logger.info("Using AzureSQL database.")
-        memory = AzureSQLMemory(**memory_instance_kwargs)
+        memory = AzureSQLMemory(silent=silent, **memory_instance_kwargs)  # type: ignore[ty:invalid-assignment]
     else:
         raise ValueError(
             f"Memory database type '{memory_db_type}' is not a supported type {get_args(MemoryDatabaseType)}"
         )
+
     CentralMemory.set_memory_instance(memory)
 
     # Combine directly provided initializers with those loaded from scripts
@@ -250,6 +361,6 @@ def initialize_pyrit(
         script_initializers = _load_initializers_from_scripts(script_paths=initialization_scripts)
         all_initializers.extend(script_initializers)
 
-    # Execute all initializers (sorted by execution_order)
+    # Execute all initializers in order
     if all_initializers:
-        _execute_initializers(initializers=all_initializers)
+        await _execute_initializers_async(initializers=all_initializers)

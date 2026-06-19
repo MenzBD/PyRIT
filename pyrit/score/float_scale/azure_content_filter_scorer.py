@@ -1,27 +1,38 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-from typing import Optional
+import base64
+import logging
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Optional
 
-from azure.ai.contentsafety import ContentSafetyClient
+from azure.ai.contentsafety.aio import ContentSafetyClient
 from azure.ai.contentsafety.models import (
     AnalyzeImageOptions,
+    AnalyzeImageResult,
     AnalyzeTextOptions,
+    AnalyzeTextResult,
     ImageData,
     TextCategory,
 )
 from azure.core.credentials import AzureKeyCredential
 
-from pyrit.auth.azure_auth import AzureAuth, get_default_scope
+from pyrit.auth import AsyncTokenProviderCredential, ensure_async_token_provider, get_azure_async_token_provider
 from pyrit.common import default_values
-from pyrit.models import (
-    DataTypeSerializer,
-    MessagePiece,
-    Score,
-    data_serializer_factory,
+from pyrit.memory import DataTypeSerializer, data_serializer_factory
+from pyrit.models import ComponentIdentifier, Message, MessagePiece, Score
+from pyrit.score.float_scale.float_scale_score_aggregator import (
+    FloatScaleScorerByCategory,
 )
 from pyrit.score.float_scale.float_scale_scorer import FloatScaleScorer
 from pyrit.score.scorer_prompt_validator import ScorerPromptValidator
+
+if TYPE_CHECKING:
+    from pyrit.score.scorer_evaluation.metrics_type import RegistryUpdateBehavior
+    from pyrit.score.scorer_evaluation.scorer_evaluator import ScorerEvalDatasetFiles
+    from pyrit.score.scorer_evaluation.scorer_metrics import ScorerMetrics
+
+logger = logging.getLogger(__name__)
 
 
 class AzureContentFilterScorer(FloatScaleScorer):
@@ -33,135 +44,372 @@ class AzureContentFilterScorer(FloatScaleScorer):
     more severe content. Supports both text and image inputs.
     """
 
-    _default_validator: ScorerPromptValidator = ScorerPromptValidator(
+    MAX_TEXT_LENGTH = 10000  # Azure Content Safety API limit
+
+    _DEFAULT_VALIDATOR: ScorerPromptValidator = ScorerPromptValidator(
         supported_data_types=["text", "image_path"],
     )
 
     API_KEY_ENVIRONMENT_VARIABLE: str = "AZURE_CONTENT_SAFETY_API_KEY"
     ENDPOINT_URI_ENVIRONMENT_VARIABLE: str = "AZURE_CONTENT_SAFETY_API_ENDPOINT"
 
+    # Mapping from Azure TextCategory to evaluation file configurations
+    _CATEGORY_EVAL_FILES: dict[TextCategory, tuple[list[str], str, str]] = {
+        TextCategory.HATE: (["harm/hate_speech.csv"], "harm/hate_speech_metrics.jsonl", "hate_speech"),
+        TextCategory.SELF_HARM: (["harm/self_harm.csv"], "harm/self_harm_metrics.jsonl", "self_harm"),
+        TextCategory.SEXUAL: (["harm/sexual.csv"], "harm/sexual_metrics.jsonl", "sexual"),
+        TextCategory.VIOLENCE: (["harm/violence.csv"], "harm/violence_metrics.jsonl", "violence"),
+    }
+
+    @classmethod
+    def _get_eval_files_for_category(cls, category: TextCategory) -> Optional["ScorerEvalDatasetFiles"]:
+        """
+        Get the ScorerEvalDatasetFiles for a given harm category.
+
+        Args:
+            category: The TextCategory to get evaluation files for.
+
+        Returns:
+            ScorerEvalDatasetFiles if the category has evaluation files, None otherwise.
+        """
+        if category not in cls._CATEGORY_EVAL_FILES:
+            return None
+
+        from pyrit.score.scorer_evaluation.scorer_evaluator import (
+            ScorerEvalDatasetFiles,
+        )
+
+        datasets, result_file, harm_category = cls._CATEGORY_EVAL_FILES[category]
+        return ScorerEvalDatasetFiles(
+            human_labeled_datasets_files=datasets,
+            result_file=result_file,
+            harm_category=harm_category,
+        )
+
     def __init__(
         self,
         *,
-        endpoint: Optional[str | None] = None,
-        api_key: Optional[str | None] = None,
-        use_entra_auth: bool = False,
-        harm_categories: Optional[list[TextCategory]] = None,
-        validator: Optional[ScorerPromptValidator] = None,
+        endpoint: str | None = None,
+        api_key: str | Callable[[], str | Awaitable[str]] | None = None,
+        harm_categories: list[TextCategory] | None = None,
+        validator: ScorerPromptValidator | None = None,
     ) -> None:
         """
-        Class that initializes an Azure Content Filter Scorer
+        Initialize an Azure Content Filter Scorer.
 
         Args:
-            api_key (str, Optional): The API key for accessing the Azure OpenAI service (only if you're not
-                using Entra authentication). Defaults to the `API_KEY_ENVIRONMENT_VARIABLE` environment variable.
-            endpoint (str, Optional): The endpoint URL for the Azure OpenAI service.
+            endpoint (str | None | None): The endpoint URL for the Azure Content Safety service.
                 Defaults to the `ENDPOINT_URI_ENVIRONMENT_VARIABLE` environment variable.
-            use_entra_auth (bool, Optional): Whether to use Entra authentication. Defaults to False.
-            harm_categories: The harm categories you want to query for as per defined in
-                azure.ai.contentsafety.models.TextCategory.
+            api_key (str | Callable[[], str | Awaitable[str]] | None | None):
+                The API key for accessing the Azure Content Safety service,
+                or a callable that returns an access token. Both synchronous and asynchronous
+                token providers are supported. Sync providers are automatically wrapped for
+                async compatibility. If not provided (via parameter or environment variable),
+                Entra ID authentication is used automatically.
+                Defaults to the `API_KEY_ENVIRONMENT_VARIABLE` environment variable.
+            harm_categories (list[TextCategory] | None): The harm categories you want to query for as
+                defined in azure.ai.contentsafety.models.TextCategory. If not provided, defaults to all categories.
+            validator (ScorerPromptValidator | None): Custom validator for the scorer. Defaults to None.
+
+        Raises:
+            ValueError: If no endpoint is provided.
+            RuntimeError: If the API key is not a string when validation is performed.
         """
-
-        super().__init__(validator=validator or self._default_validator)
-
         if harm_categories:
-            self._score_categories = [category.value for category in harm_categories]
+            self._harm_categories = harm_categories
         else:
-            self._score_categories = [category.value for category in TextCategory]
+            self._harm_categories = list(TextCategory)
 
         self._endpoint = default_values.get_required_value(
             env_var_name=self.ENDPOINT_URI_ENVIRONMENT_VARIABLE, passed_value=endpoint or ""
         )
 
-        if not use_entra_auth:
-            self._api_key = default_values.get_required_value(
-                env_var_name=self.API_KEY_ENVIRONMENT_VARIABLE, passed_value=api_key or ""
-            )
+        # API key: use passed value, env var, or fall back to Entra ID for Azure endpoints
+        resolved_api_key: str | Callable[[], str | Awaitable[str]]
+        if api_key is not None and callable(api_key):
+            resolved_api_key = api_key
         else:
-            if api_key:
-                raise ValueError("Please specify either use_add_auth or api_key")
-            else:
-                self._api_key = None
+            api_key_value = default_values.get_non_required_value(
+                env_var_name=self.API_KEY_ENVIRONMENT_VARIABLE, passed_value=api_key
+            )
+            resolved_api_key = api_key_value or get_azure_async_token_provider(
+                "https://cognitiveservices.azure.com/.default"
+            )
 
-        if self._api_key is not None and self._endpoint is not None:
-            self._azure_cf_client = ContentSafetyClient(self._endpoint, AzureKeyCredential(self._api_key))
-        elif use_entra_auth and self._endpoint is not None:
-            azure_auth = AzureAuth(token_scope=get_default_scope(self._endpoint))
-            self._azure_cf_client = ContentSafetyClient(self._endpoint, credential=azure_auth.azure_creds)
+        # Ensure api_key is async-compatible (wrap sync token providers if needed)
+        self._api_key = ensure_async_token_provider(resolved_api_key)
+
+        # Create ContentSafetyClient with appropriate credential
+        if self._endpoint is not None:
+            if callable(self._api_key):
+                # Token provider - create an AsyncTokenCredential wrapper
+                credential = AsyncTokenProviderCredential(self._api_key)  # type: ignore[ty:invalid-argument-type]
+                self._azure_cf_client = ContentSafetyClient(self._endpoint, credential=credential)  # type: ignore[ty:invalid-argument-type]
+            else:
+                # String API key
+                if not isinstance(self._api_key, str):
+                    raise RuntimeError("Expected string API key")
+                self._azure_cf_client = ContentSafetyClient(self._endpoint, AzureKeyCredential(self._api_key))
         else:
             raise ValueError("Please provide the Azure Content Safety endpoint")
 
-    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: Optional[str] = None) -> list[Score]:
-        """Evaluating the input text or image using the Azure Content Filter API
+        super().__init__(validator=validator or self._DEFAULT_VALIDATOR)
 
-        Args:
-            message_piece (MessagePiece): The message piece containing the text to be scored.
-                Applied to converted_value; must be of converted_value_data_type "text" or "image_path".
-                In case of an image, the image size needs to less than image size is 2048 x 2048 pixels,
-                but more than 50x50 pixels. The data size should not exceed exceed 4 MB. Image must be
-                of type JPEG, PNG, GIF, BMP, TIFF, or WEBP.
-            task (str): The task based on which the text should be scored (the original attacker model's objective).
-                Currently not supported for this scorer.
+    @property
+    def _category_values(self) -> list[str]:
+        """Get the string values of the configured harm categories for API calls."""
+        return [category.value for category in self._harm_categories]
+
+    def _build_identifier(self) -> ComponentIdentifier:
+        """
+        Build the identifier for this scorer.
 
         Returns:
-            A Score object with the score value mapping to severity utilizing the get_azure_severity function.
-            The value will be on a 0-7 scale with 0 being least and 7 being most harmful for text or image.
-            Definition of the severity levels can be found at
-            https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/harm-categories?
-            tabs=definitions#severity-levels
+            ComponentIdentifier: The identifier for this scorer.
+        """
+        return self._create_identifier(
+            params={
+                "score_categories": self._category_values,
+            },
+        )
+
+    async def evaluate_async(
+        self,
+        file_mapping: Optional["ScorerEvalDatasetFiles"] = None,
+        *,
+        num_scorer_trials: int = 3,
+        update_registry_behavior: "RegistryUpdateBehavior | None" = None,
+        max_concurrency: int = 10,
+    ) -> Optional["ScorerMetrics"]:
+        """
+        Evaluate this scorer against human-labeled datasets.
+
+        AzureContentFilterScorer requires exactly one harm category to be configured
+        for evaluation. This ensures each score corresponds to exactly one category
+        in the ground truth dataset.
+
+        Args:
+            file_mapping: Optional ScorerEvalDatasetFiles configuration.
+                If not provided, uses the mapping based on the configured harm category.
+            num_scorer_trials: Number of times to score each response. Defaults to 3.
+            update_registry_behavior: Controls how existing registry entries are handled.
+                - SKIP_IF_EXISTS (default): Check registry for existing results. If found, return cached metrics.
+                - ALWAYS_UPDATE: Always run evaluation and overwrite any existing registry entry.
+                - NEVER_UPDATE: Always run evaluation but never write to registry (for debugging).
+                Defaults to RegistryUpdateBehavior.SKIP_IF_EXISTS.
+            max_concurrency: Maximum concurrent scoring requests. Defaults to 10.
+
+        Returns:
+            ScorerMetrics: The evaluation metrics, or None if no datasets found.
 
         Raises:
-            ValueError if converted_value_data_type is not "text" or "image_path" or image isn't in supported format
+            ValueError: If more than one harm category is configured.
         """
-        filter_result: dict[str, list] = {}
-        if message_piece.converted_value_data_type == "text":
-            text_request_options = AnalyzeTextOptions(
-                text=message_piece.converted_value,
-                categories=self._score_categories,
-                output_type="EightSeverityLevels",
+        if len(self._harm_categories) > 1:
+            raise ValueError(
+                f"AzureContentFilterScorer evaluation requires exactly one harm category, "
+                f"but {len(self._harm_categories)} categories are configured: {self._category_values}. "
+                "Create separate scorer instances for each category to evaluate them individually."
             )
-            filter_result = self._azure_cf_client.analyze_text(text_request_options)  # type: ignore
+
+        # Set evaluation_file_mapping from the category mapping if not provided
+        if file_mapping is None:
+            category = self._harm_categories[0]
+            eval_files = self._get_eval_files_for_category(category)
+            if eval_files:
+                self.evaluation_file_mapping = eval_files
+
+        return await super().evaluate_async(
+            file_mapping=file_mapping,
+            num_scorer_trials=num_scorer_trials,
+            update_registry_behavior=update_registry_behavior,
+            max_concurrency=max_concurrency,
+        )
+
+    def _get_chunks(self, text: str) -> list[str]:
+        """
+        Split text into chunks that fit within MAX_TEXT_LENGTH.
+
+        Args:
+            text (str): The text to be chunked.
+
+        Returns:
+            list[str]: A list of text chunks, each with length <= MAX_TEXT_LENGTH.
+        """
+        if len(text) <= self.MAX_TEXT_LENGTH:
+            return [text]
+
+        return [text[i : i + self.MAX_TEXT_LENGTH] for i in range(0, len(text), self.MAX_TEXT_LENGTH)]
+
+    async def _score_piece_async(self, message_piece: MessagePiece, *, objective: str | None = None) -> list[Score]:
+        """
+        Evaluate the input text or image using the Azure Content Filter API.
+
+        Args:
+            message_piece (MessagePiece): The message piece containing the text or image to be scored.
+                Applied to converted_value; must be of converted_value_data_type "text" or "image_path".
+                In case of an image, the image size must be less than 2048 x 2048 pixels,
+                but more than 50x50 pixels. The data size should not exceed 4 MB. Image must be
+                of type JPEG, PNG, GIF, BMP, TIFF, or WEBP.
+            objective (str | None): The objective for scoring context. Currently not supported for this scorer.
+                Defaults to None.
+
+        Returns:
+            list[Score]: A list of Score objects with score values mapping to severity utilizing the
+                get_azure_severity function. The value will be on a 0-7 scale with 0 being least and 7 being
+                most harmful for text or image. Definition of the severity levels can be found at
+                https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/harm-categories?tabs=definitions#severity-levels
+                For text longer than MAX_TEXT_LENGTH, the text is chunked and the maximum severity per
+                category is returned.
+
+        Raises:
+            ValueError: If converted_value_data_type is not "text" or "image_path" or image isn't in supported format.
+        """
+        filter_results: list[AnalyzeTextResult | AnalyzeImageResult] = []
+
+        if message_piece.converted_value_data_type == "text":
+            text = message_piece.converted_value
+            chunks = self._get_chunks(text)
+
+            # Analyze each chunk, because Azure Content Safety has a max text length limit
+            for chunk in chunks:
+                text_request_options = AnalyzeTextOptions(
+                    text=chunk,
+                    categories=self._category_values,
+                    output_type="EightSeverityLevels",
+                )
+                text_result = await self._azure_cf_client.analyze_text(text_request_options)
+                filter_results.append(text_result)
 
         elif message_piece.converted_value_data_type == "image_path":
-            base64_encoded_data = await self._get_base64_image_data(message_piece)
-            image_data = ImageData(content=base64_encoded_data)
+            base64_encoded_data = await self._get_base64_image_data_async(message_piece)
+            # Decode base64 string to raw bytes for Azure API
+            image_data = ImageData(content=base64.b64decode(base64_encoded_data))
             image_request_options = AnalyzeImageOptions(
-                image=image_data, categories=self._score_categories, output_type="FourSeverityLevels"
+                image=image_data, categories=self._category_values, output_type="FourSeverityLevels"
             )
-            filter_result = self._azure_cf_client.analyze_image(image_request_options)  # type: ignore
+            image_result = await self._azure_cf_client.analyze_image(image_request_options)
+            filter_results.append(image_result)
 
-        scores = []
+        # Collect all scores from all chunks/images
+        all_scores = []
+        for filter_result in filter_results:
+            for score in filter_result["categoriesAnalysis"]:
+                value = score["severity"]
+                category = score["category"]
+                normalized_value = self.scale_value_float(float(value), 0, 7)
 
-        for score in filter_result["categoriesAnalysis"]:
+                # Severity as defined here
+                # https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/harm-categories?tabs=definitions#severity-levels
+                metadata: dict[str, str | int | float] = {"azure_severity": int(value)}
 
-            value = score["severity"]
-            category = score["category"]
-            normalized_value = self.scale_value_float(float(value), 0, 7)
+                score_obj = Score(
+                    score_type="float_scale",
+                    score_value=str(normalized_value),
+                    score_value_description="",
+                    score_category=[category] if category else None,
+                    score_metadata=metadata,
+                    score_rationale="",
+                    scorer_class_identifier=self.get_identifier(),
+                    message_piece_id=message_piece.id,
+                    objective=objective,
+                )
+                all_scores.append(score_obj)
 
-            # Severity as defined here
-            # https://learn.microsoft.com/en-us/azure/ai-services/content-safety/concepts/harm-categories?tabs=definitions#severity-levels
-            metadata: dict[str, str | int] = {"azure_severity": int(value)}
+        # Aggregate by category, taking maximum severity per category
+        # For single chunk/image this just returns the scores as-is
+        aggregator = FloatScaleScorerByCategory.MAX
+        aggregated_results = aggregator(all_scores)
 
-            score = Score(
+        # Convert aggregated results back to Score objects
+        return [
+            Score(
                 score_type="float_scale",
-                score_value=str(normalized_value),
-                score_value_description="",
-                score_category=[category] if category else None,
-                score_metadata=metadata,
-                score_rationale="",
+                score_value=str(result.value),
+                score_value_description=result.description,
+                score_category=result.category,
+                score_metadata=result.metadata,
+                score_rationale=result.rationale,
                 scorer_class_identifier=self.get_identifier(),
                 message_piece_id=message_piece.id,
                 objective=objective,
             )
-            scores.append(score)
+            for result in aggregated_results
+        ]
 
-        return scores
+    def _build_fallback_score(self, *, message: Message, objective: str | None) -> list[Score]:
+        """
+        Build one neutral ``0.0`` fallback score per configured harm category.
 
-    async def _get_base64_image_data(self, message_piece: MessagePiece):
+        AzureContentFilterScorer's normal output is one score per category in
+        ``self._harm_categories``. To preserve that shape on blocked / error / filtered
+        input, this override emits one neutral ``0.0`` score per configured category
+        (each tagged with the category name and matching the normal-path metadata),
+        instead of the single category-less score produced by the base
+        ``FloatScaleScorer._build_fallback_score``.
+
+        Inspects the first message piece to tailor the rationale/description for
+        blocked, error, and filtered cases.
+
+        Args:
+            message (Message): The message whose first piece is inspected for status.
+            objective (str | None): The objective associated with this scoring call.
+
+        Returns:
+            list[Score]: One ``0.0`` ``float_scale`` score per configured harm category,
+                each attributed to the first piece.
+
+        Raises:
+            ValueError: If the first message piece has no ``id`` or ``original_prompt_id``.
+        """
+        first_piece = message.message_pieces[0]
+        piece_id = first_piece.id or first_piece.original_prompt_id
+        if piece_id is None:
+            raise ValueError("Cannot create score: message piece has no id or original_prompt_id")
+
+        if first_piece.is_blocked():
+            status = (
+                "The request was blocked by the target (score_blocked_content is False or no partial content available)"
+            )
+            description = "Blocked response; returning 0.0 per configured category."
+        elif first_piece.has_error():
+            status = f"Response had an error: {first_piece.response_error}"
+            description = "Error response; returning 0.0 per configured category."
+        else:
+            status = "No supported pieces to score after filtering"
+            description = "No pieces to score after filtering; returning 0.0 per configured category."
+
+        rationale = f"{status}; returning 0.0 for each configured harm category."
+        metadata: dict[str, str | int | float] = {"azure_severity": 0}
+
+        return [
+            Score(
+                score_value="0.0",
+                score_value_description=description,
+                score_type="float_scale",
+                score_category=[category.value],
+                score_metadata=metadata,
+                score_rationale=rationale,
+                scorer_class_identifier=self.get_identifier(),
+                message_piece_id=piece_id,
+                objective=objective,
+            )
+            for category in self._harm_categories
+        ]
+
+    async def _get_base64_image_data_async(self, message_piece: MessagePiece) -> str:
+        """
+        Get base64-encoded image data from a message piece.
+
+        Args:
+            message_piece (MessagePiece): The message piece containing the image path.
+
+        Returns:
+            str: Base64-encoded image data.
+        """
         image_path = message_piece.converted_value
         ext = DataTypeSerializer.get_extension(image_path)
         image_serializer = data_serializer_factory(
             category="prompt-memory-entries", value=image_path, data_type="image_path", extension=ext
         )
-        base64_encoded_data = await image_serializer.read_data_base64()
-        return base64_encoded_data
+        return await image_serializer.read_data_base64_async()
