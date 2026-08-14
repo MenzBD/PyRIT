@@ -5,15 +5,17 @@ import {
   MenuList,
   MenuPopover,
   MenuTrigger,
+  useRestoreFocusTarget,
 } from '@fluentui/react-components'
 import type { MenuCheckedValueChangeData, MenuCheckedValueChangeEvent } from '@fluentui/react-components'
 import {
   ChatRegular,
   HomeRegular,
-  QuestionCircleRegular,
   SettingsRegular,
   HistoryRegular,
   PersonFeedbackRegular,
+  WrenchRegular,
+  OpenRegular,
   WeatherMoonRegular,
   WeatherSunnyRegular,
 } from '@fluentui/react-icons'
@@ -21,12 +23,11 @@ import { useTheme } from '../../hooks/useTheme'
 import type { ThemeMode } from '../../hooks/useTheme'
 import { useNavigationStyles } from './Navigation.styles'
 
-export type ViewName = 'home' | 'chat' | 'history' | 'config'
+export type ViewName = 'home' | 'chat' | 'history' | 'config' | 'initializers'
 
 interface NavigationProps {
   currentView: ViewName
   onNavigate: (view: ViewName) => void
-  onStartTour?: () => void
   onOpenFeedback: () => void
 }
 
@@ -39,9 +40,10 @@ const THEME_LABELS: Record<ThemeMode, string> = {
 }
 
 
-export default function Navigation({ currentView, onNavigate, onStartTour, onOpenFeedback }: NavigationProps) {
+export default function Navigation({ currentView, onNavigate, onOpenFeedback }: NavigationProps) {
   const styles = useNavigationStyles()
   const { mode, resolved, setMode } = useTheme()
+  const feedbackRestoreFocusTarget = useRestoreFocusTarget()
 
   const handleThemeChange = (
     _: MenuCheckedValueChangeEvent,
@@ -58,65 +60,84 @@ export default function Navigation({ currentView, onNavigate, onStartTour, onOpe
 
   return (
     <div className={styles.root} data-tour="sidebar-nav">
-      <Button
-        className={styles.navButton}
-        data-active={currentView === 'home'}
-        appearance="subtle"
-        icon={<HomeRegular />}
-        title="Home"
-        aria-label="Home"
-        onClick={() => onNavigate('home')}
-      />
+      <nav aria-label="Primary" className={styles.primaryNavigation}>
+        <Button
+          className={styles.navButton}
+          data-active={currentView === 'home'}
+          appearance="subtle"
+          icon={<HomeRegular />}
+          title="Home"
+          aria-label="Home"
+          aria-current={currentView === 'home' ? 'page' : undefined}
+          onClick={() => onNavigate('home')}
+        />
 
-      <Button
-        className={styles.navButton}
-        data-active={currentView === 'chat'}
-        appearance="subtle"
-        icon={<ChatRegular />}
-        title="Chat"
-        aria-label="Chat"
-        onClick={() => onNavigate('chat')}
-      />
+        <Button
+          className={styles.navButton}
+          data-active={currentView === 'chat'}
+          appearance="subtle"
+          icon={<ChatRegular />}
+          title="Chat"
+          aria-label="Chat"
+          aria-current={currentView === 'chat' ? 'page' : undefined}
+          onClick={() => onNavigate('chat')}
+        />
 
-      <Button
-        className={styles.navButton}
-        data-active={currentView === 'history'}
-        appearance="subtle"
-        icon={<HistoryRegular />}
-        title="Attack History"
-        aria-label="Attack History"
-        onClick={() => onNavigate('history')}
-      />
+        <Button
+          className={styles.navButton}
+          data-active={currentView === 'history'}
+          appearance="subtle"
+          icon={<HistoryRegular />}
+          title="Attack History"
+          aria-label="Attack History"
+          aria-current={currentView === 'history' ? 'page' : undefined}
+          onClick={() => onNavigate('history')}
+        />
 
-      <Button
-        className={styles.navButton}
-        data-active={currentView === 'config'}
-        appearance="subtle"
-        icon={<SettingsRegular />}
-        title="Configuration"
-        aria-label="Configuration"
-        onClick={() => onNavigate('config')}
-      />
+        <Button
+          className={styles.navButton}
+          data-active={currentView === 'config'}
+          appearance="subtle"
+          icon={<SettingsRegular />}
+          title="Configuration"
+          aria-label="Configuration"
+          aria-current={currentView === 'config' ? 'page' : undefined}
+          onClick={() => onNavigate('config')}
+        />
+
+        <Button
+          className={styles.navButton}
+          data-active={currentView === 'initializers'}
+          appearance="subtle"
+          icon={<WrenchRegular />}
+          title="Initializers"
+          aria-label="Initializers"
+          aria-current={currentView === 'initializers' ? 'page' : undefined}
+          onClick={() => onNavigate('initializers')}
+        />
+      </nav>
 
       <div className={styles.spacer} />
 
-      {onStartTour && (
-        <Button
-          className={styles.navButton}
-          appearance="subtle"
-          icon={<QuestionCircleRegular />}
-          onClick={onStartTour}
-          title="Take a tour"
-          aria-label="Take a tour"
-        />
-      )}
       <Button
+        {...feedbackRestoreFocusTarget}
         className={styles.navButton}
         appearance="subtle"
         icon={<PersonFeedbackRegular />}
         title="Feedback"
         aria-label="Feedback"
         onClick={onOpenFeedback}
+      />
+      <Button
+        as="a"
+        className={styles.navButton}
+        appearance="subtle"
+        icon={<OpenRegular />}
+        title="Security"
+        aria-label="Security"
+        href="https://github.com/microsoft/PyRIT/security/policy"
+        target="_blank"
+        rel="noreferrer"
       />
       <Menu
         checkedValues={{ [THEME_MENU_NAME]: [mode] }}
