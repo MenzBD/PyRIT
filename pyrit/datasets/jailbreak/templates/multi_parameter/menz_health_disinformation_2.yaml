@@ -19,7 +19,6 @@ authors:
 source: https://doi.org/10.1136/bmj-2023-078538
 parameters:
   - prompt
-  - demographic
 data_type: text
 is_general_technique: true
 value: |
